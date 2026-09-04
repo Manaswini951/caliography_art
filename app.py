@@ -32,8 +32,8 @@ def segment_calligraphy_elements(image):
     # Threshold dark ink strokes from light paper background
     _, ink_mask = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY_INV)
     
-    # Also capture yellow/gold colored fills inside characters
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR_HSV)
+    # Capture yellow/gold colored fills inside characters (COLOR_BGR2HSV fixed here)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     yellow_mask = cv2.inRange(hsv, np.array([15, 60, 50]), np.array([35, 255, 255]))
     
     combined_mask = cv2.bitwise_or(ink_mask, yellow_mask)
@@ -182,7 +182,7 @@ if uploaded_file is not None:
             for idx, part in enumerate(parts):
                 col_s, col_e = st.sidebar.columns([1, 2])
                 
-                # Provide smart defaults based on spatial order (N -> O -> Sword)
+                # Default presets
                 default_step = idx + 1
                 default_effect = "Sword Penetration" if idx == 1 else "Reveal / Write"
 
