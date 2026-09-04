@@ -23,8 +23,8 @@ st.set_page_config(
 st.title("✒️ Calligraphy Writing & Sword Animator")
 
 st.write(
-    "Upload multiple calligraphy artworks at once. Configure default parameters, "
-    "process them automatically one by one, and download the entire result folder as a ZIP package."
+    "Upload multiple calligraphy images. Customize settings per image if needed, "
+    "or let the global defaults handle them automatically before exporting as a ZIP folder."
 )
 
 
@@ -159,7 +159,7 @@ def segment_components_by_color_bands(image):
 
 
 # ============================================================
-# PATH & SKELETON UTILITIES
+# SKELETONIZATION & PATH UTILITIES
 # ============================================================
 
 def morphological_skeleton(binary):
@@ -507,68 +507,34 @@ def build_gif(frames, duration=60):
     return buf.getvalue()
 
 
-# ============================================================
-# BATCH PROCESSOR PIPELINE
-# ============================================================
+def create_component_preview(image, components, assignments=None):
+    preview = image.copy()
+    group_colors = {
+        "Standalone": (0, 200, 0),
+        "Group A": (255, 100, 0),
+        "Group B": (255, 0, 255),
+        "Group C": (0, 200, 255),
+    }
 
-def process_single_image(img, bg_mode, sequence_strategy, writing_default_direction, show_pen, enable_fade_in, fade_in_percent, total_frames):
-    img = resize_image(img, max_size=900)
+    for idx, component in enumerate(components):
+        role = assignments.get(idx, {}).get("role", "Writing") if assignments else "Writing"
+        if role == "Ignore":
+            continue
 
-    if bg_mode == "Pure White Canvas":
-        base_background = np.full_like(img, 255, dtype=np.uint8)
-    elif bg_mode == "Original Paper Background":
-        base_background = img.copy()
-    else:
-        base_background = create_clean_paper_background(img)
+        group_id = assignments.get(idx, {}).get("group_id", "Standalone") if assignments else "Standalone"
+        x1, y1, x2, y2 = component["bbox"]
 
-    parts = segment_components_by_color_bands(img)
-    if not parts:
-        return None
-
-    fade_in_frames = int((fade_in_percent / 100.0) * total_frames) if enable_fade_in else 0
-
-    for component in parts:
-        component["direction"] = writing_default_direction
-        prepare_component(component, img, writing_default_direction)
-
-    assignments = {}
-    for idx, component in enumerate(parts):
-        role = component.get("default_role", "Writing")
-        if sequence_strategy == "Letters Written First, Then Sword Enters":
-            default_write_start = int((idx / max(1, len(parts))) * 40)
-            default_write_dur = 40
-            default_sword_start = 50
-            default_sword_dur = 35
-        else:
-            default_sword_start = 0
-            default_sword_dur = 35
-            default_write_start = int(40 + (idx / max(1, len(parts))) * 40)
-            default_write_dur = 40
-
-        if role == "Writing":
-            assignments[idx] = {
-                "role": "Writing", "group_id": "Standalone",
-                "start": default_write_start / 100.0, "duration": default_write_dur / 100.0
-            }
-        elif role == "Sword":
-            assignments[idx] = {
-                "role": "Sword", "group_id": "Standalone",
-                "start": default_sword_start / 100.0, "duration": default_sword_dur / 100.0,
-                "entry_direction": "Top-Right", "penetration": 0, "angle": 0
-            }
-        else:
-            assignments[idx] = {"role": "Static", "group_id": "Standalone", "start": 0.0, "duration": 1.0}
-
-    frames = []
-    for frame_index in range(total_frames):
-        frame = render_animation_frame(
-            img, base_background, parts, assignments, frame_index, total_frames,
-            show_pen, {}, enable_fade_in, fade_in_frames
+        rectangle_color = group_colors.get(group_id, (0, 200, 0)) if group_id != "Standalone" else (
+            (255, 0, 0) if role == "Sword" else ((128, 128, 128) if role == "Static" else (0, 200, 0))
         )
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(Image.fromarray(np.ascontiguousarray(rgb_frame)))
 
-    return build_gif(frames, duration=60)
+        cv2.rectangle(preview, (x1, y1), (x2, y2), rectangle_color, 2)
+        group_label = f" [{group_id}]" if group_id != "Standalone" else ""
+        cv2.putText(
+            preview, f"P{idx + 1}{group_label}", (x1, max(20, y1 - 7)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA
+        )
+    return preview
 
 
 # ============================================================
@@ -581,7 +547,7 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-st.sidebar.header("⚙️ Batch Render Settings")
+st.sidebar.header("⚙️ Global Default Settings")
 
 bg_mode = st.sidebar.selectbox(
     "Background Canvas Style",
@@ -608,27 +574,170 @@ total_frames = st.sidebar.slider("Animation Frames", 30, 150, 60, step=5)
 gif_duration = st.sidebar.slider("Frame Duration (ms)", 30, 150, 60, step=10)
 
 if uploaded_files:
-    st.info(f"📂 {len(uploaded_files)} image(s) loaded for batch animation processing.")
+    st.info(f"📂 {len(uploaded_files)} image(s) loaded. You can fine-tune individual images in the tabs below or process them immediately with global defaults.")
 
-    if st.button("🚀 Process All Images & Generate Zip Folder", type="primary"):
+    # Storage for per-image custom settings
+    custom_image_configs = {}
+
+    tabs = st.tabs([f"🖼️ {f.name}" for f in uploaded_files])
+
+    for tab, file in zip(tabs, uploaded_files):
+        with tab:
+            file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+            if img is None:
+                st.error("Invalid image format.")
+                continue
+
+            img = resize_image(img, max_size=900)
+            parts = segment_components_by_color_bands(img)
+
+            if not parts:
+                st.warning("No artwork components detected in this image.")
+                continue
+
+            st.markdown(f"#### Custom Controls for `{file.name}`")
+            st.caption("Leave options untouched to use global defaults automatically.")
+
+            for component in parts:
+                component["direction"] = writing_default_direction
+                prepare_component(component, img, writing_default_direction)
+
+            assignments = {}
+            group_roles = {}
+
+            col_preview, col_controls = st.columns([1, 1])
+
+            with col_controls:
+                for idx, component in enumerate(parts):
+                    color_name = component.get("color_name", "Ink")
+                    st.markdown(f"**P{idx + 1} - {color_name}**")
+
+                    group_id = st.selectbox(
+                        f"Group ID (Image: {file.name}, P{idx + 1})",
+                        ["Standalone", "Group A", "Group B", "Group C"],
+                        index=0, key=f"grp_{file.name}_{idx}"
+                    )
+
+                    default_role = component.get("default_role", "Writing")
+                    if group_id != "Standalone" and group_id in group_roles:
+                        role = group_roles[group_id]
+                    else:
+                        role = st.selectbox(
+                            f"Role (Image: {file.name}, P{idx + 1})",
+                            ["Writing", "Sword", "Static", "Ignore"],
+                            index=["Writing", "Sword", "Static", "Ignore"].index(default_role if default_role in ["Writing", "Sword", "Static"] else "Writing"),
+                            key=f"role_{file.name}_{idx}"
+                        )
+                        if group_id != "Standalone":
+                            group_roles[group_id] = role
+
+                    if sequence_strategy == "Letters Written First, Then Sword Enters":
+                        default_write_start, default_write_dur = int((idx / max(1, len(parts))) * 40), 40
+                        default_sword_start, default_sword_dur = 50, 35
+                    else:
+                        default_sword_start, default_sword_dur = 0, 35
+                        default_write_start, default_write_dur = int(40 + (idx / max(1, len(parts))) * 40), 40
+
+                    if role == "Writing":
+                        dir_options = ["Left -> Right", "Top -> Bottom", "Bottom -> Top", "Right -> Left"]
+                        direction = st.selectbox(
+                            f"Direction (Image: {file.name}, P{idx + 1})",
+                            dir_options, index=dir_options.index(writing_default_direction),
+                            key=f"dir_{file.name}_{idx}"
+                        )
+                        start_percent = st.slider(f"Start % (P{idx + 1})", 0, 90, default_write_start, key=f"start_{file.name}_{idx}")
+                        duration_percent = st.slider(f"Duration % (P{idx + 1})", 5, 100, default_write_dur, key=f"dur_{file.name}_{idx}")
+
+                        if direction != component.get("direction"):
+                            component["direction"] = direction
+                            prepare_component(component, img, direction)
+
+                        assignments[idx] = {
+                            "role": "Writing", "group_id": group_id,
+                            "start": start_percent / 100.0, "duration": duration_percent / 100.0
+                        }
+
+                    elif role == "Sword":
+                        entry_dir = st.selectbox(
+                            f"Entry (Image: {file.name}, P{idx + 1})",
+                            ["Top", "Bottom", "Left", "Right", "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"],
+                            index=5, key=f"sw_dir_{file.name}_{idx}"
+                        )
+                        start_percent = st.slider(f"Sword Start % (P{idx + 1})", 0, 95, default_sword_start, key=f"sw_start_{file.name}_{idx}")
+                        duration_percent = st.slider(f"Sword Travel % (P{idx + 1})", 5, 100, default_sword_dur, key=f"sw_dur_{file.name}_{idx}")
+                        penetration = st.slider(f"Penetration % (P{idx + 1})", 0, 100, 0, key=f"pen_{file.name}_{idx}")
+                        angle = st.slider(f"Angle (P{idx + 1})", -180, 180, 0, key=f"ang_{file.name}_{idx}")
+
+                        assignments[idx] = {
+                            "role": "Sword", "group_id": group_id,
+                            "start": start_percent / 100.0, "duration": duration_percent / 100.0,
+                            "entry_direction": entry_dir, "penetration": penetration, "angle": angle
+                        }
+                    elif role == "Static":
+                        assignments[idx] = {"role": "Static", "group_id": group_id, "start": 0.0, "duration": 1.0}
+                    else:
+                        assignments[idx] = {"role": "Ignore", "group_id": group_id, "start": 0.0, "duration": 0.0}
+
+            with col_preview:
+                st.subheader("🔍 Component Map")
+                preview = create_component_preview(img, parts, assignments)
+                st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+            custom_image_configs[file.name] = {
+                "img": img,
+                "parts": parts,
+                "assignments": assignments
+            }
+
+    st.markdown("---")
+
+    if st.button("🚀 Render All Images & Download ZIP", type="primary"):
         batch_progress = st.progress(0)
         status_text = st.empty()
-        
-        # In-Memory ZIP Buffer
+
         zip_buffer = io.BytesIO()
 
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
             for idx, file in enumerate(uploaded_files):
-                status_text.write(f"Processing ({idx + 1}/{len(uploaded_files)}): **{file.name}**...")
-                
-                file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
-                img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                status_text.write(f"Rendering ({idx + 1}/{len(uploaded_files)}): **{file.name}**...")
 
-                if img is not None:
-                    gif_bytes = process_single_image(
-                        img, bg_mode, sequence_strategy, writing_default_direction,
-                        show_pen, enable_fade_in, fade_in_percent, total_frames
-                    )
+                cfg = custom_image_configs.get(file.name)
+                if cfg:
+                    img = cfg["img"]
+                    parts = cfg["parts"]
+                    assignments = cfg["assignments"]
+
+                    if bg_mode == "Pure White Canvas":
+                        base_background = np.full_like(img, 255, dtype=np.uint8)
+                    elif bg_mode == "Original Paper Background":
+                        base_background = img.copy()
+                    else:
+                        base_background = create_clean_paper_background(img)
+
+                    fade_in_frames = int((fade_in_percent / 100.0) * total_frames) if enable_fade_in else 0
+
+                    group_bboxes = {}
+                    for g_id in ["Group A", "Group B", "Group C"]:
+                        member_indices = [i for i, a in assignments.items() if a.get("group_id") == g_id]
+                        if member_indices:
+                            x1 = min(parts[i]["bbox"][0] for i in member_indices)
+                            y1 = min(parts[i]["bbox"][1] for i in member_indices)
+                            x2 = max(parts[i]["bbox"][2] for i in member_indices)
+                            y2 = max(parts[i]["bbox"][3] for i in member_indices)
+                            group_bboxes[g_id] = (x1, y1, x2, y2)
+
+                    frames = []
+                    for frame_index in range(total_frames):
+                        frame = render_animation_frame(
+                            img, base_background, parts, assignments, frame_index, total_frames,
+                            show_pen, group_bboxes, enable_fade_in, fade_in_frames
+                        )
+                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frames.append(Image.fromarray(np.ascontiguousarray(rgb_frame)))
+
+                    gif_bytes = build_gif(frames, duration=gif_duration)
 
                     if gif_bytes:
                         out_filename = f"animated_{file.name.rsplit('.', 1)[0]}.gif"
@@ -636,7 +745,7 @@ if uploaded_files:
 
                 batch_progress.progress((idx + 1) / len(uploaded_files))
 
-        status_text.success("🎉 All images processed successfully!")
+        status_text.success("🎉 All animations rendered successfully!")
         batch_progress.empty()
 
         zip_buffer.seek(0)
