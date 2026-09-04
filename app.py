@@ -6,181 +6,142 @@ import streamlit as st
 from PIL import Image
 
 st.set_page_config(
-    page_title="Calligraphy & Character Animator",
-    page_icon="🗡️",
+    page_title="Sequential Calligraphy Animator",
+    page_icon="🖋️",
     layout="wide",
 )
 
-st.title("🗡️ Calligraphy & Character Penetration Animator")
+st.title("🖋️ Sequential Calligraphy & Penetration Animator")
 st.write(
-    "Upload calligraphy art. Assign dedicated motions like **Sword Penetration** "
-    "to selected elements to watch them slide in and pierce the artwork dynamically."
+    "Upload your calligraphy artwork. Assign an **Appearance Order** to each detected "
+    "stroke so elements reveal step-by-step from a blank canvas before the final penetration effect."
 )
 
+
 # ============================================================
-# ACCURATE HSV COLOR BOUNDS
+# COMPONENT SEGMENTATION & INPAINTING
 # ============================================================
 
-COLOR_RANGES = {
-    "Black / Dark Ink": [(np.array([0, 0, 0]), np.array([180, 255, 65]))],
-    "Red": [
-        (np.array([0, 70, 50]), np.array([8, 255, 255])),
-        (np.array([172, 70, 50]), np.array([180, 255, 255])),
-    ],
-    "Yellow / Gold": [(np.array([15, 70, 50]), np.array([34, 255, 255]))],
-    "Green": [(np.array([35, 50, 40]), np.array([84, 255, 255]))],
-    "Blue": [(np.array([106, 50, 40]), np.array([130, 255, 255]))],
-    "Purple / Violet": [(np.array([131, 50, 40]), np.array([155, 255, 255]))],
-}
-
-ALL_MOTIONS = [
-    "None (Static)",
-    "Sword Penetration",
-    "Advanced Walk",
-    "Belly Laugh",
-    "Natural Sway",
-    "Playful Bounce",
-    "Dynamic Wave",
-    "Breathing Pulse",
-]
-
-
-def extract_accurate_colors(image):
-    """Scans image using defined HSV ranges to isolate distinct strokes/ink."""
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    total_pixels = image.shape[0] * image.shape[1]
-    detected = []
-
-    for name, ranges in COLOR_RANGES.items():
-        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lower, upper in ranges:
-            mask = cv2.inRange(hsv, lower, upper)
-            combined_mask = cv2.bitwise_or(combined_mask, mask)
-
-        pixel_count = cv2.countNonZero(combined_mask)
-        coverage = (pixel_count / total_pixels) * 100
-
-        if coverage > 0.05:
-            detected.append({
-                "name": name,
-                "coverage": coverage,
-                "mask": combined_mask,
-            })
-
-    return detected
-
-
-def extract_independent_parts(detected_colors):
-    """Separates connected component strokes for fine-grained animation control."""
-    color_parts_map = {}
-
-    for color_info in detected_colors:
-        color_name = color_info["name"]
-        mask = color_info["mask"]
-
-        clean_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(clean_mask, connectivity=8)
-
-        parts = []
-        for i in range(1, num_labels):
-            area = int(stats[i, cv2.CC_STAT_AREA])
-            if area < 30:
-                continue
-
-            comp = (labels == i).astype(np.uint8) * 255
-            ys, xs = np.where(comp > 0)
-            if len(xs) < 10:
-                continue
-
-            parts.append({
-                "mask": comp > 0,
-                "bbox": (int(np.min(xs)), int(np.min(ys)), int(np.max(xs)), int(np.max(ys))),
-                "center": (float(np.mean(xs)), float(np.mean(ys))),
-                "area": area,
-            })
-
-        if parts:
-            color_parts_map[color_name] = parts
-
-    return color_parts_map
-
-
-def animate_penetration(original, sword_part, background_img, frame_index, total_frames):
+def segment_calligraphy_elements(image):
     """
-    Renders a progressive vertical penetration effect:
-    The element translates down from above while being clipped progressively
-    to simulate entering/piercing into the artwork.
+    Separates dark ink strokes and colored fills into distinct spatial components
+    and generates a clean, stroke-free paper background.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Threshold dark ink strokes from light paper background
+    _, ink_mask = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY_INV)
+    
+    # Also capture yellow/gold colored fills inside characters
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR_HSV)
+    yellow_mask = cv2.inRange(hsv, np.array([15, 60, 50]), np.array([35, 255, 255]))
+    
+    combined_mask = cv2.bitwise_or(ink_mask, yellow_mask)
+    clean_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    
+    # Generate clean paper background by erasing all ink
+    background_paper = cv2.inpaint(image, clean_mask, inpaintRadius=9, flags=cv2.INPAINT_TELEA)
+
+    # Separate into connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(clean_mask, connectivity=8)
+
+    parts = []
+    h, w = image.shape[:2]
+    min_area = max(50, int(h * w * 0.0002))
+
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+
+        comp_mask = (labels == i)
+        ys, xs = np.where(comp_mask)
+        if len(xs) < 15:
+            continue
+
+        min_x, max_x = int(np.min(xs)), int(np.max(xs))
+        min_y, max_y = int(np.min(ys)), int(np.max(ys))
+
+        parts.append({
+            "id": i,
+            "mask": comp_mask,
+            "bbox": (min_x, min_y, max_x, max_y),
+            "center": (float(centroids[i][0]), float(centroids[i][1])),
+            "area": area,
+        })
+
+    # Sort left-to-right based on bounding box
+    parts.sort(key=lambda p: p["bbox"][0])
+    return parts, background_paper
+
+
+def render_sequential_frame(original, background_paper, parts, assignments, frame_index, total_frames):
+    """
+    Renders frames sequentially based on assigned appearance steps.
     """
     h, w = original.shape[:2]
-    progress = float(frame_index) / float(total_frames - 1)
+    canvas = background_paper.copy()
 
-    min_x, min_y, max_x, max_y = sword_part["bbox"]
-    sword_height = max_y - min_y
+    # Determine max sequence step
+    max_step = max([a["step"] for a in assignments.values()]) if assignments else 1
+    
+    # Calculate global timeline phase
+    step_duration = total_frames / float(max_step)
+    current_step = int(frame_index / step_duration) + 1
+    step_progress = (frame_index % step_duration) / step_duration
 
-    # Calculate vertical movement (starts off-screen/above and slides down)
-    y_offset = int((1.0 - progress) * (sword_height + 20))
-
-    # Create displacement matrices
     grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    map_x = grid_x.copy()
-    map_y = grid_y + y_offset  # Pull pixels from higher up
 
-    # Warp the full image to move the sword
-    warped_full = cv2.remap(original, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    for idx, part in enumerate(parts):
+        part_config = assignments.get(idx, {"step": 1, "effect": "Reveal / Write"})
+        step = part_config["step"]
+        effect = part_config["effect"]
+        part_mask = part["mask"]
 
-    # Build progressive reveal mask (cut-off line moves down)
-    reveal_line = min_y + int(progress * (sword_height + 30))
-    reveal_mask = grid_y <= reveal_line
+        # 1. Component hasn't appeared yet -> Stay blank paper
+        if current_step < step:
+            continue
 
-    # Combine shifted sword pixels onto static background using masks
-    sword_mask = sword_part["mask"]
-    active_mask = sword_mask & reveal_mask
+        # 2. Component is fully revealed in an earlier step -> Draw static
+        elif current_step > step:
+            canvas[part_mask] = original[part_mask]
 
-    result = background_img.copy()
-    result[active_mask] = warped_full[active_mask]
+        # 3. Component is currently animating in this active step
+        else:
+            min_x, min_y, max_x, max_y = part["bbox"]
+            
+            if effect == "Sword Penetration":
+                sword_h = max_y - min_y
+                # Vertical translation: slides down from above
+                y_shift = int((1.0 - step_progress) * (sword_h + 30))
+                
+                map_x = grid_x.copy()
+                map_y = grid_y + y_shift
+                warped_original = cv2.remap(original, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
-    return result
+                # Progressive linear penetration reveal
+                reveal_y = min_y + int(step_progress * (sword_h + 40))
+                active_reveal = (grid_y <= reveal_y) & part_mask
 
+                canvas[active_reveal] = warped_original[active_reveal]
 
-def animate_custom_frame(original, color_parts_map, assignments, frame_index, total_frames, intensity):
-    h, w = original.shape[:2]
+            elif effect == "Reveal / Write":
+                # Brush write effect: progressive top-to-bottom stroke reveal
+                part_h = max_y - min_y
+                reveal_y = min_y + int(step_progress * part_h)
+                active_reveal = (grid_y <= reveal_y) & part_mask
 
-    # Create static background base image (fill sword areas with surrounding paper color)
-    background_img = original.copy()
-    for color_name, motion in assignments.items():
-        if motion == "Sword Penetration":
-            for part in color_parts_map[color_name]:
-                # Inpaint/erase sword stroke to build clean background paper
-                mask_uint = (part["mask"]).astype(np.uint8) * 255
-                background_img = cv2.inpaint(background_img, mask_uint, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+                canvas[active_reveal] = original[active_reveal]
 
-    frame = background_img.copy()
+            elif effect == "Fade In":
+                # Alpha blending fade in
+                alpha = step_progress
+                canvas[part_mask] = cv2.addWeighted(original, alpha, background_paper, 1.0 - alpha, 0)[part_mask]
 
-    # Process each color group based on assigned motion
-    for color_name, parts in color_parts_map.items():
-        motion = assignments.get(color_name, "None (Static)")
+            else:  # Instant Appearance
+                canvas[part_mask] = original[part_mask]
 
-        if motion == "Sword Penetration":
-            for part in parts:
-                frame = animate_penetration(original, part, background_img, frame_index, total_frames)
-
-        elif motion != "None (Static)":
-            grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-            map_x, map_y = grid_x.copy(), grid_y.copy()
-            phase = 2.0 * math.pi * float(frame_index) / float(total_frames)
-
-            for part in parts:
-                mask = part["mask"]
-                cx, cy = part["center"]
-                dx = math.sin(phase) * intensity
-                map_x[mask] -= dx
-
-            warped = cv2.remap(original, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-            # Blend distorted part onto composite frame
-            for part in parts:
-                frame[part["mask"]] = warped[part["mask"]]
-
-    return frame
+    return canvas
 
 
 def build_gif(frames, duration=60):
@@ -191,7 +152,7 @@ def build_gif(frames, duration=60):
 
 
 # ============================================================
-# STREAMLIT UI
+# STREAMLIT INTERFACE
 # ============================================================
 
 uploaded_file = st.file_uploader("Upload Calligraphy Image", type=["jpg", "jpeg", "png", "webp"])
@@ -210,64 +171,71 @@ if uploaded_file is not None:
             scale = 900.0 / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-        detected_colors = extract_accurate_colors(img)
-        color_parts_map = extract_independent_parts(detected_colors)
+        parts, background_paper = segment_calligraphy_elements(img)
 
-        st.sidebar.header("⚙️ Penetration Controls")
+        st.sidebar.header("⚙️ Sequence & Animation Timeline")
         assignments = {}
 
-        if color_parts_map:
-            st.sidebar.write("Select **'Sword Penetration'** for the sword ink stroke:")
+        if parts:
+            st.sidebar.write("Set appearance order and entry effects:")
 
-            for idx, (color_name, parts) in enumerate(color_parts_map.items()):
-                # Default dark ink to penetration for quick testing
-                default_idx = 1 if "Black" in color_name else 0
-                selected = st.sidebar.selectbox(
-                    f"Stroke Layer: {color_name} ({len(parts)} segments)",
-                    ALL_MOTIONS,
-                    index=default_idx,
-                    key=f"motion_{color_name}",
-                )
-                assignments[color_name] = selected
+            for idx, part in enumerate(parts):
+                col_s, col_e = st.sidebar.columns([1, 2])
+                
+                # Provide smart defaults based on spatial order (N -> O -> Sword)
+                default_step = idx + 1
+                default_effect = "Sword Penetration" if idx == 1 else "Reveal / Write"
+
+                with col_s:
+                    step = st.number_input(f"Part {idx+1} Step", min_value=1, max_value=10, value=default_step, key=f"step_{idx}")
+                with col_e:
+                    effect = st.selectbox(
+                        f"Effect",
+                        ["Reveal / Write", "Sword Penetration", "Fade In", "Instant"],
+                        index=["Reveal / Write", "Sword Penetration", "Fade In", "Instant"].index(default_effect),
+                        key=f"effect_{idx}",
+                    )
+
+                assignments[idx] = {"step": step, "effect": effect}
         else:
             st.sidebar.warning("No distinct ink strokes detected.")
 
-        frame_count = st.sidebar.slider("Animation Resolution (Frames)", 12, 36, 24)
-        intensity = float(st.sidebar.slider("Motion Speed / Intensity", 4, 30, 12))
+        total_frames = st.sidebar.slider("Total Animation Duration (Frames)", 18, 60, 36)
 
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("Original Calligraphy")
+            st.subheader("Original Artwork")
             st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
         with col2:
-            st.subheader("Detected Stroke Segments")
+            st.subheader("Detected Components & Clean Paper")
             preview = img.copy()
-            for color_name, parts in color_parts_map.items():
-                for p in parts:
-                    x1, y1, x2, y2 = p["bbox"]
-                    cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            for idx, p in enumerate(parts):
+                x1, y1, x2, y2 = p["bbox"]
+                cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(preview, f"P{idx+1}", (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
             st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
 
         st.markdown("---")
 
-        if st.button("✨ Render Penetration Animation", type="primary", disabled=(len(color_parts_map) == 0)):
-            with st.spinner("Rendering progressive piercing animation..."):
+        if st.button("✨ Render Sequential Animation", type="primary", disabled=(len(parts) == 0)):
+            with st.spinner("Erasing artwork to blank paper & rendering sequential timeline..."):
                 frames = []
-                for i in range(frame_count):
-                    frame = animate_custom_frame(img, color_parts_map, assignments, i, frame_count, intensity)
+                for i in range(total_frames):
+                    frame = render_sequential_frame(img, background_paper, parts, assignments, i, total_frames)
                     rgb_frame = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     frames.append(Image.fromarray(rgb_frame))
 
                 gif_bytes = build_gif(frames, duration=70)
 
-            st.subheader("🎬 Penetration Result")
+            st.subheader("🎬 Final Sequential Penetration GIF")
             st.image(gif_bytes, width=450)
 
             st.download_button(
-                "Download Piercing GIF",
+                "Download Animation GIF",
                 data=gif_bytes,
-                file_name="sword_penetration_calligraphy.gif",
+                file_name="sequential_sword_calligraphy.gif",
                 mime="image/gif",
             )
 
