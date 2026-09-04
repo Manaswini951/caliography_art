@@ -1,5 +1,6 @@
 import io
 import math
+import zipfile
 from collections import deque
 
 import cv2
@@ -13,7 +14,7 @@ from PIL import Image, ImageDraw
 # ============================================================
 
 st.set_page_config(
-    page_title="Calligraphy Writing & Sword Animator",
+    page_title="Calligraphy Writing & Sword Animator (Batch Mode)",
     page_icon="✒️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -22,8 +23,8 @@ st.set_page_config(
 st.title("✒️ Calligraphy Writing & Sword Animator")
 
 st.write(
-    "Upload your calligraphy artwork. Group multi-colored segments, sync writing paths "
-    "with a single continuous brush nib, and smoothly fade in the original artwork at the end."
+    "Upload multiple calligraphy artworks at once. Configure default parameters, "
+    "process them automatically one by one, and download the entire result folder as a ZIP package."
 )
 
 
@@ -158,7 +159,7 @@ def segment_components_by_color_bands(image):
 
 
 # ============================================================
-# SKELETONIZATION & PATH UTILITIES
+# PATH & SKELETON UTILITIES
 # ============================================================
 
 def morphological_skeleton(binary):
@@ -203,7 +204,7 @@ def find_skeleton_endpoints(skeleton):
     return endpoints
 
 
-def choose_start_point(skeleton, direction="Auto"):
+def choose_start_point(skeleton, direction="Left -> Right"):
     endpoints = find_skeleton_endpoints(skeleton)
     ys, xs = np.where(skeleton)
     if len(xs) == 0:
@@ -506,286 +507,142 @@ def build_gif(frames, duration=60):
     return buf.getvalue()
 
 
-def create_component_preview(image, components, assignments=None):
-    preview = image.copy()
-    group_colors = {
-        "Standalone": (0, 200, 0),
-        "Group A": (255, 100, 0),
-        "Group B": (255, 0, 255),
-        "Group C": (0, 200, 255),
-    }
+# ============================================================
+# BATCH PROCESSOR PIPELINE
+# ============================================================
 
-    for idx, component in enumerate(components):
-        role = assignments.get(idx, {}).get("role", "Writing") if assignments else "Writing"
-        if role == "Ignore":
-            continue
+def process_single_image(img, bg_mode, sequence_strategy, writing_default_direction, show_pen, enable_fade_in, fade_in_percent, total_frames):
+    img = resize_image(img, max_size=900)
 
-        group_id = assignments.get(idx, {}).get("group_id", "Standalone") if assignments else "Standalone"
-        x1, y1, x2, y2 = component["bbox"]
+    if bg_mode == "Pure White Canvas":
+        base_background = np.full_like(img, 255, dtype=np.uint8)
+    elif bg_mode == "Original Paper Background":
+        base_background = img.copy()
+    else:
+        base_background = create_clean_paper_background(img)
 
-        rectangle_color = group_colors.get(group_id, (0, 200, 0)) if group_id != "Standalone" else (
-            (255, 0, 0) if role == "Sword" else ((128, 128, 128) if role == "Static" else (0, 200, 0))
+    parts = segment_components_by_color_bands(img)
+    if not parts:
+        return None
+
+    fade_in_frames = int((fade_in_percent / 100.0) * total_frames) if enable_fade_in else 0
+
+    for component in parts:
+        component["direction"] = writing_default_direction
+        prepare_component(component, img, writing_default_direction)
+
+    assignments = {}
+    for idx, component in enumerate(parts):
+        role = component.get("default_role", "Writing")
+        if sequence_strategy == "Letters Written First, Then Sword Enters":
+            default_write_start = int((idx / max(1, len(parts))) * 40)
+            default_write_dur = 40
+            default_sword_start = 50
+            default_sword_dur = 35
+        else:
+            default_sword_start = 0
+            default_sword_dur = 35
+            default_write_start = int(40 + (idx / max(1, len(parts))) * 40)
+            default_write_dur = 40
+
+        if role == "Writing":
+            assignments[idx] = {
+                "role": "Writing", "group_id": "Standalone",
+                "start": default_write_start / 100.0, "duration": default_write_dur / 100.0
+            }
+        elif role == "Sword":
+            assignments[idx] = {
+                "role": "Sword", "group_id": "Standalone",
+                "start": default_sword_start / 100.0, "duration": default_sword_dur / 100.0,
+                "entry_direction": "Top-Right", "penetration": 0, "angle": 0
+            }
+        else:
+            assignments[idx] = {"role": "Static", "group_id": "Standalone", "start": 0.0, "duration": 1.0}
+
+    frames = []
+    for frame_index in range(total_frames):
+        frame = render_animation_frame(
+            img, base_background, parts, assignments, frame_index, total_frames,
+            show_pen, {}, enable_fade_in, fade_in_frames
         )
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(Image.fromarray(np.ascontiguousarray(rgb_frame)))
 
-        cv2.rectangle(preview, (x1, y1), (x2, y2), rectangle_color, 2)
-        group_label = f" [{group_id}]" if group_id != "Standalone" else ""
-        cv2.putText(
-            preview, f"P{idx + 1}{group_label}", (x1, max(20, y1 - 7)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA
-        )
-    return preview
-
-
-def role_description(role):
-    if role == "Writing": return "✒️ Draw this component progressively."
-    if role == "Sword": return "⚔️ Move this component from outside into the artwork."
-    if role == "Static": return "📌 Show this component immediately."
-    return "🚫 Hide this component."
+    return build_gif(frames, duration=60)
 
 
 # ============================================================
 # MAIN STREAMLIT APP
 # ============================================================
 
-uploaded_file = st.file_uploader(
-    "Upload Calligraphy Image", type=["jpg", "jpeg", "png", "webp"]
+uploaded_files = st.file_uploader(
+    "Upload Calligraphy Images (Multiple Selection Supported)",
+    type=["jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True
 )
 
-if uploaded_file is not None:
-    try:
-        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+st.sidebar.header("⚙️ Batch Render Settings")
 
-        if img is None:
-            st.error("Invalid image format.")
-            st.stop()
+bg_mode = st.sidebar.selectbox(
+    "Background Canvas Style",
+    ["Pure White Canvas", "Original Paper Background", "Cleaned Paper Texture"],
+    index=0
+)
 
-        img = resize_image(img, max_size=900)
+sequence_strategy = st.sidebar.radio(
+    "Animation Sequence Strategy",
+    ["Letters Written First, Then Sword Enters", "Sword Enters First, Then Letters Written"],
+    index=0
+)
 
-        st.sidebar.header("⚙️ Global Settings")
+writing_default_direction = st.sidebar.selectbox(
+    "Default Writing Direction",
+    ["Left -> Right", "Top -> Bottom", "Bottom -> Top", "Right -> Left"],
+    index=0
+)
 
-        bg_mode = st.sidebar.selectbox(
-            "Background Canvas Style",
-            [
-                "Pure White Canvas",
-                "Original Paper Background",
-                "Cleaned Paper Texture"
-            ],
-            index=0
+show_pen = st.sidebar.checkbox("Single Pen Tip Tracking All Writing Strokes", value=True)
+enable_fade_in = st.sidebar.checkbox("Enable Final Artwork Fade-In Reveal", value=True)
+fade_in_percent = st.sidebar.slider("Fade-In Duration %", 5, 40, 20) if enable_fade_in else 0
+total_frames = st.sidebar.slider("Animation Frames", 30, 150, 60, step=5)
+gif_duration = st.sidebar.slider("Frame Duration (ms)", 30, 150, 60, step=10)
+
+if uploaded_files:
+    st.info(f"📂 {len(uploaded_files)} image(s) loaded for batch animation processing.")
+
+    if st.button("🚀 Process All Images & Generate Zip Folder", type="primary"):
+        batch_progress = st.progress(0)
+        status_text = st.empty()
+        
+        # In-Memory ZIP Buffer
+        zip_buffer = io.BytesIO()
+
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for idx, file in enumerate(uploaded_files):
+                status_text.write(f"Processing ({idx + 1}/{len(uploaded_files)}): **{file.name}**...")
+                
+                file_bytes = np.asarray(bytearray(file.read()), dtype=np.uint8)
+                img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+                if img is not None:
+                    gif_bytes = process_single_image(
+                        img, bg_mode, sequence_strategy, writing_default_direction,
+                        show_pen, enable_fade_in, fade_in_percent, total_frames
+                    )
+
+                    if gif_bytes:
+                        out_filename = f"animated_{file.name.rsplit('.', 1)[0]}.gif"
+                        zip_file.writestr(out_filename, gif_bytes)
+
+                batch_progress.progress((idx + 1) / len(uploaded_files))
+
+        status_text.success("🎉 All images processed successfully!")
+        batch_progress.empty()
+
+        zip_buffer.seek(0)
+        st.download_button(
+            "📦 Download All Animated GIFs (.ZIP Folder)",
+            data=zip_buffer.getvalue(),
+            file_name="calligraphy_animations_folder.zip",
+            mime="application/zip"
         )
-
-        if bg_mode == "Pure White Canvas":
-            base_background = np.full_like(img, 255, dtype=np.uint8)
-        elif bg_mode == "Original Paper Background":
-            base_background = img.copy()
-        else:
-            base_background = create_clean_paper_background(img)
-
-        with st.spinner("Detecting artwork components..."):
-            parts = segment_components_by_color_bands(img)
-
-        if not parts:
-            st.error("No artwork components were detected.")
-            st.stop()
-
-        sequence_strategy = st.sidebar.radio(
-            "Animation Sequence Strategy",
-            [
-                "Letters Written First, Then Sword Enters",
-                "Sword Enters First, Then Letters Written"
-            ],
-            index=0
-        )
-
-        use_uniform_direction = st.sidebar.checkbox(
-            "Use Uniform Direction for All Writing Strokes", value=True
-        )
-
-        writing_default_direction = st.sidebar.selectbox(
-            "Default Writing Direction",
-            ["Left -> Right", "Top -> Bottom", "Bottom -> Top", "Right -> Left"],
-            index=0
-        )
-
-        show_pen = st.sidebar.checkbox("Single Pen Tip Tracking All Writing Strokes", value=True)
-
-        enable_fade_in = st.sidebar.checkbox("Enable Final Artwork Fade-In Reveal", value=True)
-        fade_in_percent = st.sidebar.slider("Fade-In Duration %", 5, 40, 20) if enable_fade_in else 0
-
-        total_frames = st.sidebar.slider("Animation Frames", 30, 150, 70, step=5)
-        gif_duration = st.sidebar.slider("Frame Duration (ms)", 30, 150, 60, step=10)
-
-        fade_in_frames = int((fade_in_percent / 100.0) * total_frames) if enable_fade_in else 0
-
-        for component in parts:
-            component["direction"] = writing_default_direction
-            prepare_component(component, img, writing_default_direction)
-
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("🎬 Component & Multi-Color Object Grouping")
-
-        assignments = {}
-        group_roles = {}
-
-        for idx, component in enumerate(parts):
-            color_name = component.get("color_name", "Ink")
-            st.sidebar.markdown(f"### P{idx + 1} - {color_name}")
-
-            group_id = st.sidebar.selectbox(
-                f"Group Object Assignment for P{idx + 1}",
-                ["Standalone", "Group A", "Group B", "Group C"],
-                index=0,
-                key=f"group_{idx}"
-            )
-
-            default_role = component.get("default_role", "Writing")
-
-            if group_id != "Standalone" and group_id in group_roles:
-                role = group_roles[group_id]
-                st.sidebar.info(f"Inherited Role from {group_id}: **{role}**")
-            else:
-                role = st.sidebar.selectbox(
-                    "Role", ["Writing", "Sword", "Static", "Ignore"],
-                    index=["Writing", "Sword", "Static", "Ignore"].index(default_role if default_role in ["Writing", "Sword", "Static"] else "Writing"),
-                    key=f"role_{idx}"
-                )
-                if group_id != "Standalone":
-                    group_roles[group_id] = role
-
-            st.sidebar.caption(role_description(role))
-
-            if sequence_strategy == "Letters Written First, Then Sword Enters":
-                default_write_start = int((idx / max(1, len(parts))) * 40)
-                default_write_dur = 40
-                default_sword_start = 50
-                default_sword_dur = 35
-            else:
-                default_sword_start = 0
-                default_sword_dur = 35
-                default_write_start = int(40 + (idx / max(1, len(parts))) * 40)
-                default_write_dur = 40
-
-            if role == "Writing":
-                dir_options = ["Left -> Right", "Top -> Bottom", "Bottom -> Top", "Right -> Left"]
-                default_dir_idx = dir_options.index(writing_default_direction) if writing_default_direction in dir_options else 0
-
-                direction = st.sidebar.selectbox(
-                    "Writing Start",
-                    dir_options,
-                    index=default_dir_idx if use_uniform_direction else default_dir_idx,
-                    key=f"writing_dir_{idx}"
-                )
-                start_percent = st.sidebar.slider(
-                    "Start Time %", 0, 90, default_write_start, key=f"start_write_{idx}"
-                )
-                duration_percent = st.sidebar.slider(
-                    "Writing Duration %", 5, 100, default_write_dur, key=f"duration_write_{idx}"
-                )
-
-                if direction != component.get("direction"):
-                    component["direction"] = direction
-                    prepare_component(component, img, direction)
-
-                assignments[idx] = {
-                    "role": "Writing",
-                    "group_id": group_id,
-                    "start": start_percent / 100.0,
-                    "duration": duration_percent / 100.0
-                }
-
-            elif role == "Sword":
-                entry_direction = st.sidebar.selectbox(
-                    "Sword Entry",
-                    ["Top", "Bottom", "Left", "Right", "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"],
-                    index=5,
-                    key=f"sword_entry_{idx}"
-                )
-                start_percent = st.sidebar.slider("Sword Start %", 0, 95, default_sword_start, key=f"sword_start_{idx}")
-                duration_percent = st.sidebar.slider("Sword Travel %", 5, 100, default_sword_dur, key=f"sword_duration_{idx}")
-                penetration = st.sidebar.slider("Penetration Depth %", 0, 100, 0, key=f"penetration_{idx}")
-                angle = st.sidebar.slider("Sword Angle", -180, 180, 0, key=f"sword_angle_{idx}")
-
-                assignments[idx] = {
-                    "role": "Sword",
-                    "group_id": group_id,
-                    "start": start_percent / 100.0,
-                    "duration": duration_percent / 100.0,
-                    "entry_direction": entry_direction,
-                    "penetration": penetration,
-                    "angle": angle,
-                }
-            elif role == "Static":
-                assignments[idx] = {"role": "Static", "group_id": group_id, "start": 0.0, "duration": 1.0}
-            else:
-                assignments[idx] = {"role": "Ignore", "group_id": group_id, "start": 0.0, "duration": 0.0}
-
-            st.sidebar.markdown("---")
-
-        group_bboxes = {}
-        for g_id in ["Group A", "Group B", "Group C"]:
-            member_indices = [i for i, a in assignments.items() if a.get("group_id") == g_id]
-            if member_indices:
-                x1 = min(parts[i]["bbox"][0] for i in member_indices)
-                y1 = min(parts[i]["bbox"][1] for i in member_indices)
-                x2 = max(parts[i]["bbox"][2] for i in member_indices)
-                y2 = max(parts[i]["bbox"][3] for i in member_indices)
-                group_bboxes[g_id] = (x1, y1, x2, y2)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("🖼️ Original Artwork")
-            st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
-
-        with col2:
-            st.subheader("🔍 Detected & Grouped Components")
-            preview = create_component_preview(img, parts, assignments)
-            st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
-
-        writing_count = sum(1 for a in assignments.values() if a.get("role") == "Writing")
-        sword_count = sum(1 for a in assignments.values() if a.get("role") == "Sword")
-        static_count = sum(1 for a in assignments.values() if a.get("role") == "Static")
-        ignore_count = sum(1 for a in assignments.values() if a.get("role") == "Ignore")
-
-        st.info(
-            f"Detected {len(parts)} color components — "
-            f"✒️ Writing: {writing_count} | "
-            f"⚔️ Sword: {sword_count} | "
-            f"📌 Static: {static_count} | "
-            f"🚫 Ignored: {ignore_count}"
-        )
-
-        st.markdown("---")
-
-        if st.button("✨ Render Handwritten Calligraphy Animation", type="primary"):
-            progress_bar = st.progress(0)
-            status = st.empty()
-            frames = []
-
-            for frame_index in range(total_frames):
-                status.write(f"Rendering frame {frame_index + 1} / {total_frames}")
-                frame = render_animation_frame(
-                    img, base_background, parts, assignments, frame_index, total_frames,
-                    show_pen, group_bboxes, enable_fade_in, fade_in_frames
-                )
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(np.ascontiguousarray(rgb_frame)))
-                progress_bar.progress((frame_index + 1) / total_frames)
-
-            status.write("Building GIF...")
-            gif_bytes = build_gif(frames, duration=gif_duration)
-            progress_bar.empty()
-            status.success("Animation completed!")
-
-            st.subheader("🎬 Animated Result")
-            st.image(gif_bytes, width=600)
-
-            st.download_button(
-                "⬇️ Download GIF",
-                data=gif_bytes,
-                file_name="calligraphy_handwriting_sword.gif",
-                mime="image/gif"
-            )
-
-    except Exception as e:
-        st.error(f"Error encountered: {e}")
-        st.exception(e)
