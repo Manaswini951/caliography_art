@@ -22,9 +22,8 @@ st.set_page_config(
 st.title("✒️ Calligraphy Writing & Sword Animator")
 
 st.write(
-    "Upload your calligraphy artwork. The app uses targeted HSV color bands "
-    "to separate overlapping strokes (e.g. purple sword vs pink letter) and renders "
-    "them on a pure white canvas with fully customizable sequencing."
+    "Upload your calligraphy artwork. The app uses targeted HSV color band thresholding "
+    "to isolate overlapping strokes, with options to group multi-colored objects together or animate them separately."
 )
 
 
@@ -50,9 +49,10 @@ def resize_image(img, max_size=900):
     )
 
 
-def segment_components_by_color_bands(image):
+def segment_components_by_color_bands(image, fuse_multicolor=False):
     """
     HSV Band Thresholding to isolate foreground ink colors cleanly.
+    Includes an option to fuse touching/adjacent multi-colored objects into single components.
     """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     h, w = image.shape[:2]
@@ -146,6 +146,54 @@ def segment_components_by_color_bands(image):
             })
 
             processed_mask = cv2.bitwise_or(processed_mask, (comp_mask.astype(np.uint8) * 255))
+
+    # --- MULTI-COLOR FUSION OPTION ---
+    if fuse_multicolor and len(components) > 1:
+        # Dilate masks slightly to find touching components of different colors
+        fused_components = []
+        used = [False] * len(components)
+
+        for i in range(len(components)):
+            if used[i]:
+                continue
+
+            combined_mask = components[i]["mask"].copy()
+            combined_names = [components[i]["color_name"]]
+            role = components[i]["default_role"]
+            used[i] = True
+
+            kernel_touch = np.ones((9, 9), np.uint8)
+
+            for j in range(i + 1, len(components)):
+                if used[j]:
+                    continue
+
+                # Check if component i touches component j
+                dilated_i = cv2.dilate(combined_mask.astype(np.uint8), kernel_touch)
+                overlap = cv2.bitwise_and(dilated_i, components[j]["mask"].astype(np.uint8))
+
+                if cv2.countNonZero(overlap) > 0:
+                    combined_mask = cv2.bitwise_or(combined_mask, components[j]["mask"])
+                    combined_names.append(components[j]["color_name"])
+                    if components[j]["default_role"] == "Sword":
+                        role = "Sword"
+                    used[j] = True
+
+            ys, xs = np.where(combined_mask)
+            cx, cy = int(xs.min()), int(ys.min())
+            cw, ch = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
+
+            fused_components.append({
+                "id": len(fused_components) + 1,
+                "mask": combined_mask,
+                "bbox": (cx, cy, cx + cw - 1, cy + ch - 1),
+                "center": (float(xs.mean()), float(ys.mean())),
+                "area": int(len(xs)),
+                "color_name": "/".join(set(combined_names)) + " (Fused)",
+                "default_role": role
+            })
+
+        components = fused_components
 
     components.sort(key=lambda p: (p["bbox"][0], p["bbox"][1]))
     return components
@@ -396,14 +444,11 @@ def render_sword(canvas, original, component, progress, entry_direction, penetra
 
     object_size = max(x2 - x1, y2 - y1)
     entry_distance = object_size * 1.6 + 80
-
-    # At progress = 1.0, travel distance is 0, placing sword EXACTLY at its original position
     travel = (1.0 - progress) * entry_distance
 
     dx = rotated_x * travel
     dy = rotated_y * travel
 
-    # Apply extra penetration push during entrance animation phase if configured
     penetration_distance = (penetration / 100.0) * object_size * 0.75
     if progress > 0.72 and progress < 1.0:
         pen_phase = (progress - 0.72) / 0.28
@@ -434,12 +479,12 @@ def render_animation_frame(original, components, assignments, frame_index, total
     canvas = np.full_like(original, 255, dtype=np.uint8)
     global_progress = 1.0 if total_frames <= 1 else frame_index / float(total_frames - 1)
 
-    # Pass 1: Static elements
+    # Pass 1: Static
     for idx, component in enumerate(components):
         if assignments.get(idx, {}).get("role") == "Static":
             render_static_component(canvas, original, component)
 
-    # Pass 2: Writing elements
+    # Pass 2: Writing
     for idx, component in enumerate(components):
         config = assignments.get(idx, {})
         if config.get("role", "Writing") != "Writing":
@@ -453,7 +498,7 @@ def render_animation_frame(original, components, assignments, frame_index, total
         if show_pen and 0.0 < local < 1.0:
             draw_pen_tip(canvas, component, local)
 
-    # Pass 3: Sword / Weapon elements
+    # Pass 3: Sword / Weapon
     for idx, component in enumerate(components):
         config = assignments.get(idx, {})
         if config.get("role") != "Sword":
@@ -525,16 +570,26 @@ if uploaded_file is not None:
 
         img = resize_image(img, max_size=900)
 
-        with st.spinner("Detecting components using HSV band thresholding..."):
-            parts = segment_components_by_color_bands(img)
+        st.sidebar.header("⚙️ Global Settings")
+
+        # MULTI-COLOR HANDLING OPTION
+        color_handling = st.sidebar.radio(
+            "Multi-Color Object Handling",
+            [
+                "Separate Color Bands (Fine Control)",
+                "Fuse Touching Colors into Single Objects"
+            ],
+            index=0
+        )
+        fuse_multicolor = (color_handling == "Fuse Touching Colors into Single Objects")
+
+        with st.spinner("Detecting artwork components..."):
+            parts = segment_components_by_color_bands(img, fuse_multicolor=fuse_multicolor)
 
         if not parts:
             st.error("No artwork components were detected.")
             st.stop()
 
-        st.sidebar.header("⚙️ Animation Controls")
-
-        # SEQUENCE CONTROL: Sword first vs Writing first
         sequence_strategy = st.sidebar.radio(
             "Animation Sequence Strategy",
             [
@@ -577,7 +632,6 @@ if uploaded_file is not None:
             )
             st.sidebar.caption(role_description(role))
 
-            # Sequence Default Defaults
             if sequence_strategy == "Letters Written First, Then Sword Enters":
                 default_write_start = int((idx / max(1, len(parts))) * 45)
                 default_write_dur = 45
