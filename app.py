@@ -22,8 +22,8 @@ st.set_page_config(
 st.title("✒️ Calligraphy Writing & Sword Animator")
 
 st.write(
-    "Upload your calligraphy artwork. Adjust background blending and component roles "
-    "to handle lighting, thin strokes, and overlapping artwork seamlessly."
+    "Upload your calligraphy artwork. Assign specific components (e.g. P1 and P4) "
+    "to a shared Group ID to animate them as a single synchronized multi-colored object."
 )
 
 
@@ -50,9 +50,6 @@ def resize_image(img, max_size=900):
 
 
 def create_clean_paper_background(image):
-    """
-    Normalizes uneven lighting/vignetting on paper while retaining paper texture.
-    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     dilated = cv2.dilate(gray, np.ones((15, 15), np.uint8))
     bg_img = cv2.medianBlur(dilated, 21)
@@ -61,23 +58,22 @@ def create_clean_paper_background(image):
     return cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR)
 
 
-def segment_components_by_color_bands(image, fuse_multicolor=False):
+def segment_components_by_color_bands(image):
     """
-    HSV Band Thresholding optimized for both thick markers and thin ink strokes.
+    HSV Band Thresholding to isolate individual color strokes.
     """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     h, w = image.shape[:2]
     min_area = max(20, int(h * w * 0.00008))
 
     color_ranges = [
-        # Purple / Violet (Sword / Dark strokes)
+        # Purple / Violet
         {
             "name": "Purple/Violet",
             "ranges": [(np.array([110, 25, 25]), np.array([155, 255, 255]))],
             "role": "Sword"
         },
-        # Pink / Magenta / Red
+        # Pink / Magenta
         {
             "name": "Pink/Magenta",
             "ranges": [
@@ -104,7 +100,7 @@ def segment_components_by_color_bands(image, fuse_multicolor=False):
             "ranges": [(np.array([36, 25, 25]), np.array([84, 255, 255]))],
             "role": "Writing"
         },
-        # Dark Ink (Thin or dark pen strokes)
+        # Dark Ink
         {
             "name": "Dark Ink",
             "ranges": [(np.array([0, 0, 0]), np.array([180, 255, 130]))],
@@ -123,7 +119,6 @@ def segment_components_by_color_bands(image, fuse_multicolor=False):
 
         band_mask = cv2.bitwise_and(band_mask, cv2.bitwise_not(processed_mask))
 
-        # Morphological operations tailored to keep fine lines connected
         kernel_close = np.ones((3, 3), np.uint8)
         band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, kernel_close)
 
@@ -158,58 +153,12 @@ def segment_components_by_color_bands(image, fuse_multicolor=False):
 
             processed_mask = cv2.bitwise_or(processed_mask, (comp_mask.astype(np.uint8) * 255))
 
-    # --- MULTI-COLOR FUSION OPTION ---
-    if fuse_multicolor and len(components) > 1:
-        fused_components = []
-        used = [False] * len(components)
-
-        for i in range(len(components)):
-            if used[i]:
-                continue
-
-            combined_mask = components[i]["mask"].copy()
-            combined_names = [components[i]["color_name"]]
-            role = components[i]["default_role"]
-            used[i] = True
-
-            kernel_touch = np.ones((11, 11), np.uint8)
-
-            for j in range(i + 1, len(components)):
-                if used[j]:
-                    continue
-
-                dilated_i = cv2.dilate(combined_mask.astype(np.uint8), kernel_touch)
-                overlap = cv2.bitwise_and(dilated_i, components[j]["mask"].astype(np.uint8))
-
-                if cv2.countNonZero(overlap) > 0:
-                    combined_mask = cv2.bitwise_or(combined_mask, components[j]["mask"])
-                    combined_names.append(components[j]["color_name"])
-                    if components[j]["default_role"] == "Sword":
-                        role = "Sword"
-                    used[j] = True
-
-            ys, xs = np.where(combined_mask)
-            cx, cy = int(xs.min()), int(ys.min())
-            cw, ch = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
-
-            fused_components.append({
-                "id": len(fused_components) + 1,
-                "mask": combined_mask,
-                "bbox": (cx, cy, cx + cw - 1, cy + ch - 1),
-                "center": (float(xs.mean()), float(ys.mean())),
-                "area": int(len(xs)),
-                "color_name": "/".join(set(combined_names)) + " (Fused)",
-                "default_role": role
-            })
-
-        components = fused_components
-
     components.sort(key=lambda p: (p["bbox"][0], p["bbox"][1]))
     return components
 
 
 # ============================================================
-# SKELETONIZATION
+# SKELETONIZATION & PATH UTILITIES
 # ============================================================
 
 def morphological_skeleton(binary):
@@ -230,10 +179,6 @@ def morphological_skeleton(binary):
 
     return skeleton > 0
 
-
-# ============================================================
-# PATH EXTRACTION & REVEAL MASKS
-# ============================================================
 
 def skeleton_neighbors(point, skeleton):
     y, x = point
@@ -434,15 +379,17 @@ def shift_mask(mask, dx, dy):
     return shifted > 0
 
 
-def shift_image(image, base_bg, dx, dy):
+def shift_image(image, dx, dy):
     h, w = image.shape[:2]
     matrix = np.float32([[1, 0, dx], [0, 1, dy]])
-    return cv2.warpAffine(image, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
+    return cv2.warpAffine(image, matrix, (w, h), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
 
 
-def render_sword(canvas, original, component, progress, entry_direction, penetration, angle_degrees):
+def render_sword(canvas, original, component, progress, entry_direction, penetration, angle_degrees, ref_bbox=None):
     mask = component["mask"]
-    x1, y1, x2, y2 = component["bbox"]
+    bbox = ref_bbox if ref_bbox is not None else component["bbox"]
+    x1, y1, x2, y2 = bbox
+
     vw, vh = direction_vector(entry_direction)
     vw, vh = normalize_vector(vw, vh)
 
@@ -464,7 +411,7 @@ def render_sword(canvas, original, component, progress, entry_direction, penetra
         dx += rotated_x * penetration_distance * pen_phase
         dy += rotated_y * penetration_distance * pen_phase
 
-    shifted = shift_image(original, canvas, int(round(dx)), int(round(dy)))
+    shifted = shift_image(original, int(round(dx)), int(round(dy)))
     shifted_mask = shift_mask(mask, int(round(dx)), int(round(dy)))
     canvas[shifted_mask] = shifted[shifted_mask]
 
@@ -484,8 +431,7 @@ def ease_out(t):
     return 1.0 - (1.0 - t) ** 3
 
 
-def render_animation_frame(original, base_background, components, assignments, frame_index, total_frames, show_pen):
-    # Initialize frame with selected background canvas (Pure White, Original Paper, or Cleaned Paper)
+def render_animation_frame(original, base_background, components, assignments, frame_index, total_frames, show_pen, group_bboxes):
     canvas = base_background.copy()
     global_progress = 1.0 if total_frames <= 1 else frame_index / float(total_frames - 1)
 
@@ -513,6 +459,9 @@ def render_animation_frame(original, base_background, components, assignments, f
         config = assignments.get(idx, {})
         if config.get("role") != "Sword":
             continue
+        group_id = config.get("group_id", "Standalone")
+        ref_bbox = group_bboxes.get(group_id, component["bbox"]) if group_id != "Standalone" else component["bbox"]
+
         start, duration = config.get("start", 0.0), config.get("duration", 1.0)
         if global_progress < start:
             continue
@@ -522,7 +471,8 @@ def render_animation_frame(original, base_background, components, assignments, f
             canvas, original, component, local,
             config.get("entry_direction", "Top-Right"),
             config.get("penetration", 0),
-            config.get("angle", 0)
+            config.get("angle", 0),
+            ref_bbox=ref_bbox
         )
 
     return canvas
@@ -542,17 +492,29 @@ def build_gif(frames, duration=60):
 
 def create_component_preview(image, components, assignments=None):
     preview = image.copy()
+    group_colors = {
+        "Standalone": (0, 200, 0),
+        "Group A": (255, 100, 0),
+        "Group B": (255, 0, 255),
+        "Group C": (0, 200, 255),
+    }
+
     for idx, component in enumerate(components):
         role = assignments.get(idx, {}).get("role", "Writing") if assignments else "Writing"
         if role == "Ignore":
             continue
 
+        group_id = assignments.get(idx, {}).get("group_id", "Standalone") if assignments else "Standalone"
         x1, y1, x2, y2 = component["bbox"]
-        rectangle_color = (255, 0, 0) if role == "Sword" else ((128, 128, 128) if role == "Static" else (0, 200, 0))
+
+        rectangle_color = group_colors.get(group_id, (0, 200, 0)) if group_id != "Standalone" else (
+            (255, 0, 0) if role == "Sword" else ((128, 128, 128) if role == "Static" else (0, 200, 0))
+        )
 
         cv2.rectangle(preview, (x1, y1), (x2, y2), rectangle_color, 2)
+        group_label = f" [{group_id}]" if group_id != "Standalone" else ""
         cv2.putText(
-            preview, f"P{idx + 1} ({component.get('color_name', '')})", (x1, max(20, y1 - 7)),
+            preview, f"P{idx + 1}{group_label}", (x1, max(20, y1 - 7)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA
         )
     return preview
@@ -562,7 +524,7 @@ def role_description(role):
     if role == "Writing": return "✒️ Draw this component progressively."
     if role == "Sword": return "⚔️ Move this component from outside into the artwork."
     if role == "Static": return "📌 Show this component immediately."
-    return "🚫 Hide this component (ignore shadows/artifacts)."
+    return "🚫 Hide this component."
 
 
 # ============================================================
@@ -586,7 +548,6 @@ if uploaded_file is not None:
 
         st.sidebar.header("⚙️ Global Settings")
 
-        # CANVAS BACKGROUND BLENDING MODE
         bg_mode = st.sidebar.selectbox(
             "Background Canvas Style",
             [
@@ -604,18 +565,8 @@ if uploaded_file is not None:
         else:
             base_background = create_clean_paper_background(img)
 
-        color_handling = st.sidebar.radio(
-            "Multi-Color Object Handling",
-            [
-                "Separate Color Bands (Fine Control)",
-                "Fuse Touching Colors into Single Objects"
-            ],
-            index=0
-        )
-        fuse_multicolor = (color_handling == "Fuse Touching Colors into Single Objects")
-
         with st.spinner("Detecting artwork components..."):
-            parts = segment_components_by_color_bands(img, fuse_multicolor=fuse_multicolor)
+            parts = segment_components_by_color_bands(img)
 
         if not parts:
             st.error("No artwork components were detected.")
@@ -644,23 +595,37 @@ if uploaded_file is not None:
             prepare_component(component, img, writing_default_direction)
 
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🎬 Component Animation")
+        st.sidebar.subheader("🎬 Component & Multi-Color Object Grouping")
+        st.sidebar.caption("Group components (e.g. P1 + P4) into Group A to move them together as a single multi-colored object.")
 
         assignments = {}
+        group_roles = {}
 
         for idx, component in enumerate(parts):
-            x1, y1, x2, y2 = component["bbox"]
-            default_role = component.get("default_role", "Writing")
             color_name = component.get("color_name", "Ink")
-
             st.sidebar.markdown(f"### P{idx + 1} - {color_name}")
-            st.sidebar.caption(f"Size: {x2 - x1 + 1} × {y2 - y1 + 1} px")
 
-            role = st.sidebar.selectbox(
-                "Role", ["Writing", "Sword", "Static", "Ignore"],
-                index=["Writing", "Sword", "Static", "Ignore"].index(default_role if default_role in ["Writing", "Sword", "Static"] else "Writing"),
-                key=f"role_{idx}"
+            group_id = st.sidebar.selectbox(
+                f"Group Object Assignment for P{idx + 1}",
+                ["Standalone", "Group A", "Group B", "Group C"],
+                index=0,
+                key=f"group_{idx}"
             )
+
+            default_role = component.get("default_role", "Writing")
+
+            if group_id != "Standalone" and group_id in group_roles:
+                role = group_roles[group_id]
+                st.sidebar.info(f"Inherited Role from {group_id}: **{role}**")
+            else:
+                role = st.sidebar.selectbox(
+                    "Role", ["Writing", "Sword", "Static", "Ignore"],
+                    index=["Writing", "Sword", "Static", "Ignore"].index(default_role if default_role in ["Writing", "Sword", "Static"] else "Writing"),
+                    key=f"role_{idx}"
+                )
+                if group_id != "Standalone":
+                    group_roles[group_id] = role
+
             st.sidebar.caption(role_description(role))
 
             if sequence_strategy == "Letters Written First, Then Sword Enters":
@@ -682,13 +647,10 @@ if uploaded_file is not None:
                     key=f"writing_dir_{idx}"
                 )
                 start_percent = st.sidebar.slider(
-                    "Start Time %", 0, 90,
-                    default_write_start,
-                    key=f"start_write_{idx}"
+                    "Start Time %", 0, 90, default_write_start, key=f"start_write_{idx}"
                 )
                 duration_percent = st.sidebar.slider(
-                    "Writing Duration %", 5, 100, default_write_dur,
-                    key=f"duration_write_{idx}"
+                    "Writing Duration %", 5, 100, default_write_dur, key=f"duration_write_{idx}"
                 )
 
                 if direction != component.get("direction"):
@@ -697,6 +659,7 @@ if uploaded_file is not None:
 
                 assignments[idx] = {
                     "role": "Writing",
+                    "group_id": group_id,
                     "start": start_percent / 100.0,
                     "duration": duration_percent / 100.0
                 }
@@ -715,6 +678,7 @@ if uploaded_file is not None:
 
                 assignments[idx] = {
                     "role": "Sword",
+                    "group_id": group_id,
                     "start": start_percent / 100.0,
                     "duration": duration_percent / 100.0,
                     "entry_direction": entry_direction,
@@ -722,11 +686,22 @@ if uploaded_file is not None:
                     "angle": angle,
                 }
             elif role == "Static":
-                assignments[idx] = {"role": "Static", "start": 0.0, "duration": 1.0}
+                assignments[idx] = {"role": "Static", "group_id": group_id, "start": 0.0, "duration": 1.0}
             else:
-                assignments[idx] = {"role": "Ignore", "start": 0.0, "duration": 0.0}
+                assignments[idx] = {"role": "Ignore", "group_id": group_id, "start": 0.0, "duration": 0.0}
 
             st.sidebar.markdown("---")
+
+        # Compute bounding boxes for assigned groups so group members move together as one large item
+        group_bboxes = {}
+        for g_id in ["Group A", "Group B", "Group C"]:
+            member_indices = [i for i, a in assignments.items() if a.get("group_id") == g_id]
+            if member_indices:
+                x1 = min(parts[i]["bbox"][0] for i in member_indices)
+                y1 = min(parts[i]["bbox"][1] for i in member_indices)
+                x2 = max(parts[i]["bbox"][2] for i in member_indices)
+                y2 = max(parts[i]["bbox"][3] for i in member_indices)
+                group_bboxes[g_id] = (x1, y1, x2, y2)
 
         col1, col2 = st.columns(2)
         with col1:
@@ -734,7 +709,7 @@ if uploaded_file is not None:
             st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
         with col2:
-            st.subheader("🔍 Detected Components")
+            st.subheader("🔍 Detected & Grouped Components")
             preview = create_component_preview(img, parts, assignments)
             st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
 
@@ -761,7 +736,7 @@ if uploaded_file is not None:
             for frame_index in range(total_frames):
                 status.write(f"Rendering frame {frame_index + 1} / {total_frames}")
                 frame = render_animation_frame(
-                    img, base_background, parts, assignments, frame_index, total_frames, show_pen
+                    img, base_background, parts, assignments, frame_index, total_frames, show_pen, group_bboxes
                 )
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames.append(Image.fromarray(np.ascontiguousarray(rgb_frame)))
