@@ -6,43 +6,42 @@ import streamlit as st
 from PIL import Image
 
 st.set_page_config(
-    page_title="Sequential Calligraphy Animator",
-    page_icon="🖋️",
+    page_title="Calligraphy Write & Penetrate Animator",
+    page_icon="✒️",
     layout="wide",
 )
 
-st.title("🖋️ Sequential Calligraphy & Penetration Animator")
+st.title("✒️ Calligraphy Writing & Custom Penetration Animator")
 st.write(
-    "Upload your calligraphy artwork. Assign an **Appearance Order** to each detected "
-    "stroke so elements reveal step-by-step from a blank canvas before the final penetration effect."
+    "Upload your calligraphy artwork. The app creates a clean, pure-white sheet, "
+    "literally writes out selected letters step-by-step from your chosen direction, "
+    "and animates the sword penetrating along your desired angle!"
 )
 
 
 # ============================================================
-# COMPONENT SEGMENTATION & INPAINTING
+# SEGMENTATION & SOLID CANVAS GENERATION
 # ============================================================
 
-def segment_calligraphy_elements(image):
+def segment_and_create_white_canvas(image):
     """
-    Separates dark ink strokes and colored fills into distinct spatial components
-    and generates a clean, stroke-free paper background.
+    Isolates calligraphy strokes and creates a pure white background canvas.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Threshold dark ink strokes from light paper background
-    _, ink_mask = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY_INV)
+    # Threshold ink strokes (both black ink and colored fills)
+    _, ink_mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
     
-    # Capture yellow/gold colored fills inside characters (COLOR_BGR2HSV fixed here)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     yellow_mask = cv2.inRange(hsv, np.array([15, 60, 50]), np.array([35, 255, 255]))
     
     combined_mask = cv2.bitwise_or(ink_mask, yellow_mask)
     clean_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     
-    # Generate clean paper background by erasing all ink
-    background_paper = cv2.inpaint(image, clean_mask, inpaintRadius=9, flags=cv2.INPAINT_TELEA)
+    # Pure white background
+    white_canvas = np.full_like(image, 255, dtype=np.uint8)
 
-    # Separate into connected components
+    # Extract connected stroke components
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(clean_mask, connectivity=8)
 
     parts = []
@@ -70,76 +69,120 @@ def segment_calligraphy_elements(image):
             "area": area,
         })
 
-    # Sort left-to-right based on bounding box
+    # Sort left-to-right spatially
     parts.sort(key=lambda p: p["bbox"][0])
-    return parts, background_paper
+    return parts, white_canvas
 
 
-def render_sequential_frame(original, background_paper, parts, assignments, frame_index, total_frames):
+def render_writing_stroke(canvas, original, mask, bbox, progress, draw_direction):
     """
-    Renders frames sequentially based on assigned appearance steps.
+    Simulates actual ink writing across a stroke component from various directions.
     """
-    h, w = original.shape[:2]
-    canvas = background_paper.copy()
-
-    # Determine max sequence step
-    max_step = max([a["step"] for a in assignments.values()]) if assignments else 1
+    min_x, min_y, max_x, max_y = bbox
+    w_box = max_x - min_x
+    h_box = max_y - min_y
     
-    # Calculate global timeline phase
+    grid_y, grid_x = np.ogrid[:canvas.shape[0], :canvas.shape[1]]
+
+    if draw_direction == "Top -> Bottom":
+        reveal_cutoff = min_y + int(progress * h_box)
+        active_reveal = (grid_y <= reveal_cutoff) & mask
+
+    elif draw_direction == "Bottom -> Top":
+        reveal_cutoff = max_y - int(progress * h_box)
+        active_reveal = (grid_y >= reveal_cutoff) & mask
+
+    elif draw_direction == "Left -> Right":
+        reveal_cutoff = min_x + int(progress * w_box)
+        active_reveal = (grid_x <= reveal_cutoff) & mask
+
+    elif draw_direction == "Right -> Left":
+        reveal_cutoff = max_x - int(progress * w_box)
+        active_reveal = (grid_x >= reveal_cutoff) & mask
+
+    else:
+        active_reveal = mask
+
+    canvas[active_reveal] = original[active_reveal]
+
+
+def render_sword_penetration(canvas, original, mask, bbox, progress, trajectory):
+    """
+    Animates the sword sliding and penetrating into position from custom trajectory angles.
+    """
+    h, w = canvas.shape[:2]
+    min_x, min_y, max_x, max_y = bbox
+    sword_w = max_x - min_x
+    sword_h = max_y - min_y
+
+    grid_x_mat, grid_y_mat = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    grid_y_og, grid_x_og = np.ogrid[:h, :w]
+
+    # Calculate shift vector & dynamic mask
+    if trajectory == "Top -> Bottom":
+        y_shift = int((1.0 - progress) * (sword_h + 40))
+        x_shift = 0
+        reveal_cutoff = min_y + int(progress * (sword_h + 50))
+        active_mask = (grid_y_og <= reveal_cutoff) & mask
+
+    elif trajectory == "Bottom -> Top":
+        y_shift = -int((1.0 - progress) * (sword_h + 40))
+        x_shift = 0
+        reveal_cutoff = max_y - int(progress * (sword_h + 50))
+        active_mask = (grid_y_og >= reveal_cutoff) & mask
+
+    elif trajectory == "Top-Left Diagonal":
+        y_shift = int((1.0 - progress) * (sword_h + 30))
+        x_shift = int((1.0 - progress) * (sword_w + 30))
+        reveal_cutoff_y = min_y + int(progress * (sword_h + 40))
+        reveal_cutoff_x = min_x + int(progress * (sword_w + 40))
+        active_mask = (grid_y_og <= reveal_cutoff_y) & (grid_x_og <= reveal_cutoff_x) & mask
+
+    elif trajectory == "Bottom-Right Diagonal":
+        y_shift = -int((1.0 - progress) * (sword_h + 30))
+        x_shift = -int((1.0 - progress) * (sword_w + 30))
+        reveal_cutoff_y = max_y - int(progress * (sword_h + 40))
+        reveal_cutoff_x = max_x - int(progress * (sword_w + 40))
+        active_mask = (grid_y_og >= reveal_cutoff_y) & (grid_x_og >= reveal_cutoff_x) & mask
+
+    # Warp pixel map to slide the sword
+    map_x = grid_x_mat + x_shift
+    map_y = grid_y_mat + y_shift
+    warped_sword = cv2.remap(original, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+
+    canvas[active_mask] = warped_sword[active_mask]
+
+
+def render_animation_frame(original, white_canvas, parts, assignments, frame_index, total_frames):
+    h, w = original.shape[:2]
+    canvas = white_canvas.copy()
+
+    max_step = max([a["step"] for a in assignments.values()]) if assignments else 1
     step_duration = total_frames / float(max_step)
     current_step = int(frame_index / step_duration) + 1
     step_progress = (frame_index % step_duration) / step_duration
 
-    grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-
     for idx, part in enumerate(parts):
-        part_config = assignments.get(idx, {"step": 1, "effect": "Reveal / Write"})
-        step = part_config["step"]
-        effect = part_config["effect"]
+        config = assignments.get(idx, {"step": 1, "effect": "Reveal / Write", "direction": "Top -> Bottom"})
+        step = config["step"]
+        effect = config["effect"]
+        direction = config["direction"]
         part_mask = part["mask"]
 
-        # 1. Component hasn't appeared yet -> Stay blank paper
+        # Component not reached yet -> stays pure white
         if current_step < step:
             continue
 
-        # 2. Component is fully revealed in an earlier step -> Draw static
+        # Component already completed in earlier step -> fully visible
         elif current_step > step:
             canvas[part_mask] = original[part_mask]
 
-        # 3. Component is currently animating in this active step
+        # Active animation step
         else:
-            min_x, min_y, max_x, max_y = part["bbox"]
-            
             if effect == "Sword Penetration":
-                sword_h = max_y - min_y
-                # Vertical translation: slides down from above
-                y_shift = int((1.0 - step_progress) * (sword_h + 30))
-                
-                map_x = grid_x.copy()
-                map_y = grid_y + y_shift
-                warped_original = cv2.remap(original, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-
-                # Progressive linear penetration reveal
-                reveal_y = min_y + int(step_progress * (sword_h + 40))
-                active_reveal = (grid_y <= reveal_y) & part_mask
-
-                canvas[active_reveal] = warped_original[active_reveal]
-
-            elif effect == "Reveal / Write":
-                # Brush write effect: progressive top-to-bottom stroke reveal
-                part_h = max_y - min_y
-                reveal_y = min_y + int(step_progress * part_h)
-                active_reveal = (grid_y <= reveal_y) & part_mask
-
-                canvas[active_reveal] = original[active_reveal]
-
-            elif effect == "Fade In":
-                # Alpha blending fade in
-                alpha = step_progress
-                canvas[part_mask] = cv2.addWeighted(original, alpha, background_paper, 1.0 - alpha, 0)[part_mask]
-
-            else:  # Instant Appearance
-                canvas[part_mask] = original[part_mask]
+                render_sword_penetration(canvas, original, part_mask, part["bbox"], step_progress, direction)
+            else:
+                render_writing_stroke(canvas, original, part_mask, part["bbox"], step_progress, direction)
 
     return canvas
 
@@ -152,7 +195,7 @@ def build_gif(frames, duration=60):
 
 
 # ============================================================
-# STREAMLIT INTERFACE
+# STREAMLIT UI
 # ============================================================
 
 uploaded_file = st.file_uploader("Upload Calligraphy Image", type=["jpg", "jpeg", "png", "webp"])
@@ -171,36 +214,50 @@ if uploaded_file is not None:
             scale = 900.0 / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-        parts, background_paper = segment_calligraphy_elements(img)
+        parts, white_canvas = segment_and_create_white_canvas(img)
 
-        st.sidebar.header("⚙️ Sequence & Animation Timeline")
+        st.sidebar.header("⚙️ Sequence & Trajectory Controls")
         assignments = {}
 
         if parts:
-            st.sidebar.write("Set appearance order and entry effects:")
+            st.sidebar.write("Configure step order and drawing direction for each stroke:")
+
+            writing_directions = ["Top -> Bottom", "Bottom -> Top", "Left -> Right", "Right -> Left"]
+            penetration_trajectories = ["Top -> Bottom", "Bottom -> Top", "Top-Left Diagonal", "Bottom-Right Diagonal"]
 
             for idx, part in enumerate(parts):
-                col_s, col_e = st.sidebar.columns([1, 2])
+                st.sidebar.markdown(f"**Stroke Part P{idx+1}**")
                 
-                # Default presets
-                default_step = idx + 1
+                # Smart defaults: P1 (N) -> Step 1, P2 (Sword) -> Step 3, P3 (O) -> Step 2
+                default_step = 3 if idx == 1 else (1 if idx == 0 else 2)
                 default_effect = "Sword Penetration" if idx == 1 else "Reveal / Write"
 
-                with col_s:
-                    step = st.number_input(f"Part {idx+1} Step", min_value=1, max_value=10, value=default_step, key=f"step_{idx}")
-                with col_e:
+                col1, col2, col3 = st.sidebar.columns([1, 1.5, 1.5])
+                
+                with col1:
+                    step = st.number_input(f"Step", min_value=1, max_value=10, value=default_step, key=f"step_{idx}")
+                with col2:
                     effect = st.selectbox(
-                        f"Effect",
-                        ["Reveal / Write", "Sword Penetration", "Fade In", "Instant"],
-                        index=["Reveal / Write", "Sword Penetration", "Fade In", "Instant"].index(default_effect),
+                        f"Type",
+                        ["Reveal / Write", "Sword Penetration"],
+                        index=1 if default_effect == "Sword Penetration" else 0,
                         key=f"effect_{idx}",
                     )
+                with col3:
+                    dir_options = penetration_trajectories if effect == "Sword Penetration" else writing_directions
+                    direction = st.selectbox(
+                        f"Direction",
+                        dir_options,
+                        index=0,
+                        key=f"dir_{idx}",
+                    )
 
-                assignments[idx] = {"step": step, "effect": effect}
+                assignments[idx] = {"step": step, "effect": effect, "direction": direction}
+                st.sidebar.markdown("---")
         else:
             st.sidebar.warning("No distinct ink strokes detected.")
 
-        total_frames = st.sidebar.slider("Total Animation Duration (Frames)", 18, 60, 36)
+        total_frames = st.sidebar.slider("Total Animation Duration (Frames)", 20, 80, 40)
 
         col1, col2 = st.columns(2)
         with col1:
@@ -208,7 +265,7 @@ if uploaded_file is not None:
             st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
         with col2:
-            st.subheader("Detected Components & Clean Paper")
+            st.subheader("Detected Strokes & Blank Canvas Preview")
             preview = img.copy()
             for idx, p in enumerate(parts):
                 x1, y1, x2, y2 = p["bbox"]
@@ -217,25 +274,23 @@ if uploaded_file is not None:
 
             st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-        st.markdown("---")
-
-        if st.button("✨ Render Sequential Animation", type="primary", disabled=(len(parts) == 0)):
-            with st.spinner("Erasing artwork to blank paper & rendering sequential timeline..."):
+        if st.button("✨ Render Pure-White Calligraphy Animation", type="primary", disabled=(len(parts) == 0)):
+            with st.spinner("Writing calligraphy on pure white page & animating custom penetration..."):
                 frames = []
                 for i in range(total_frames):
-                    frame = render_sequential_frame(img, background_paper, parts, assignments, i, total_frames)
+                    frame = render_animation_frame(img, white_canvas, parts, assignments, i, total_frames)
                     rgb_frame = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     frames.append(Image.fromarray(rgb_frame))
 
                 gif_bytes = build_gif(frames, duration=70)
 
-            st.subheader("🎬 Final Sequential Penetration GIF")
-            st.image(gif_bytes, width=450)
+            st.subheader("🎬 Final Animated Calligraphy Result")
+            st.image(gif_bytes, width=480)
 
             st.download_button(
-                "Download Animation GIF",
+                "Download Custom GIF",
                 data=gif_bytes,
-                file_name="sequential_sword_calligraphy.gif",
+                file_name="pure_white_calligraphy_penetration.gif",
                 mime="image/gif",
             )
 
