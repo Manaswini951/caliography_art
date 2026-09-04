@@ -22,8 +22,9 @@ st.set_page_config(
 st.title("✒️ Calligraphy Writing & Sword Animator")
 
 st.write(
-    "Upload your calligraphy artwork. The app uses HSV color band thresholding "
-    "to isolate overlapping strokes, rendering them progressively on a pure white background."
+    "Upload your calligraphy artwork. The app uses targeted HSV color bands "
+    "to separate overlapping strokes (e.g. purple sword vs pink letter) and renders "
+    "them on a pure white canvas with fully customizable sequencing."
 )
 
 
@@ -379,7 +380,6 @@ def shift_mask(mask, dx, dy):
 def shift_image(image, dx, dy):
     h, w = image.shape[:2]
     matrix = np.float32([[1, 0, dx], [0, 1, dy]])
-    # Shifts image while padding background with pure white (255, 255, 255)
     return cv2.warpAffine(image, matrix, (w, h), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
 
 
@@ -396,13 +396,16 @@ def render_sword(canvas, original, component, progress, entry_direction, penetra
 
     object_size = max(x2 - x1, y2 - y1)
     entry_distance = object_size * 1.6 + 80
+
+    # At progress = 1.0, travel distance is 0, placing sword EXACTLY at its original position
     travel = (1.0 - progress) * entry_distance
 
     dx = rotated_x * travel
     dy = rotated_y * travel
 
+    # Apply extra penetration push during entrance animation phase if configured
     penetration_distance = (penetration / 100.0) * object_size * 0.75
-    if progress > 0.72:
+    if progress > 0.72 and progress < 1.0:
         pen_phase = (progress - 0.72) / 0.28
         dx += rotated_x * penetration_distance * pen_phase
         dy += rotated_y * penetration_distance * pen_phase
@@ -428,7 +431,6 @@ def ease_out(t):
 
 
 def render_animation_frame(original, components, assignments, frame_index, total_frames, show_pen):
-    # Pure white canvas for every frame (255, 255, 255)
     canvas = np.full_like(original, 255, dtype=np.uint8)
     global_progress = 1.0 if total_frames <= 1 else frame_index / float(total_frames - 1)
 
@@ -437,7 +439,7 @@ def render_animation_frame(original, components, assignments, frame_index, total
         if assignments.get(idx, {}).get("role") == "Static":
             render_static_component(canvas, original, component)
 
-    # Pass 2: Writing elements (Progressively drawn onto pure white canvas)
+    # Pass 2: Writing elements
     for idx, component in enumerate(components):
         config = assignments.get(idx, {})
         if config.get("role", "Writing") != "Writing":
@@ -451,7 +453,7 @@ def render_animation_frame(original, components, assignments, frame_index, total
         if show_pen and 0.0 < local < 1.0:
             draw_pen_tip(canvas, component, local)
 
-    # Pass 3: Sword / Weapon elements (Moves in from offscreen onto pure white canvas)
+    # Pass 3: Sword / Weapon elements
     for idx, component in enumerate(components):
         config = assignments.get(idx, {})
         if config.get("role") != "Sword":
@@ -464,7 +466,7 @@ def render_animation_frame(original, components, assignments, frame_index, total
         render_sword(
             canvas, original, component, local,
             config.get("entry_direction", "Top-Right"),
-            config.get("penetration", 25),
+            config.get("penetration", 0),
             config.get("angle", 0)
         )
 
@@ -531,6 +533,17 @@ if uploaded_file is not None:
             st.stop()
 
         st.sidebar.header("⚙️ Animation Controls")
+
+        # SEQUENCE CONTROL: Sword first vs Writing first
+        sequence_strategy = st.sidebar.radio(
+            "Animation Sequence Strategy",
+            [
+                "Letters Written First, Then Sword Enters",
+                "Sword Enters First, Then Letters Written"
+            ],
+            index=0
+        )
+
         writing_default_direction = st.sidebar.selectbox(
             "Default Writing Direction",
             ["Top -> Bottom", "Bottom -> Top", "Left -> Right", "Right -> Left"],
@@ -564,6 +577,18 @@ if uploaded_file is not None:
             )
             st.sidebar.caption(role_description(role))
 
+            # Sequence Default Defaults
+            if sequence_strategy == "Letters Written First, Then Sword Enters":
+                default_write_start = int((idx / max(1, len(parts))) * 45)
+                default_write_dur = 45
+                default_sword_start = 55
+                default_sword_dur = 40
+            else:
+                default_sword_start = 0
+                default_sword_dur = 40
+                default_write_start = int(45 + (idx / max(1, len(parts))) * 40)
+                default_write_dur = 45
+
             if role == "Writing":
                 direction = st.sidebar.selectbox(
                     "Writing Start",
@@ -573,11 +598,11 @@ if uploaded_file is not None:
                 )
                 start_percent = st.sidebar.slider(
                     "Start Time %", 0, 90,
-                    int(idx * (60 / max(1, len(parts)))),
+                    default_write_start,
                     key=f"start_write_{idx}"
                 )
                 duration_percent = st.sidebar.slider(
-                    "Writing Duration %", 5, 100, 35,
+                    "Writing Duration %", 5, 100, default_write_dur,
                     key=f"duration_write_{idx}"
                 )
 
@@ -598,9 +623,9 @@ if uploaded_file is not None:
                     index=5,
                     key=f"sword_entry_{idx}"
                 )
-                start_percent = st.sidebar.slider("Sword Start %", 0, 95, 50, key=f"sword_start_{idx}")
-                duration_percent = st.sidebar.slider("Sword Travel %", 5, 70, 30, key=f"sword_duration_{idx}")
-                penetration = st.sidebar.slider("Penetration Depth %", 0, 100, 30, key=f"penetration_{idx}")
+                start_percent = st.sidebar.slider("Sword Start %", 0, 95, default_sword_start, key=f"sword_start_{idx}")
+                duration_percent = st.sidebar.slider("Sword Travel %", 5, 100, default_sword_dur, key=f"sword_duration_{idx}")
+                penetration = st.sidebar.slider("Penetration Depth %", 0, 100, 0, key=f"penetration_{idx}")
                 angle = st.sidebar.slider("Sword Angle", -180, 180, 0, key=f"sword_angle_{idx}")
 
                 assignments[idx] = {
