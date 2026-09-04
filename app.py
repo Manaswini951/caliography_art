@@ -22,8 +22,8 @@ st.set_page_config(
 st.title("✒️ Calligraphy Writing & Sword Animator")
 
 st.write(
-    "Upload your calligraphy artwork. The app uses targeted HSV color band thresholding "
-    "to isolate overlapping strokes, with options to group multi-colored objects together or animate them separately."
+    "Upload your calligraphy artwork. Adjust background blending and component roles "
+    "to handle lighting, thin strokes, and overlapping artwork seamlessly."
 )
 
 
@@ -49,53 +49,65 @@ def resize_image(img, max_size=900):
     )
 
 
+def create_clean_paper_background(image):
+    """
+    Normalizes uneven lighting/vignetting on paper while retaining paper texture.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    dilated = cv2.dilate(gray, np.ones((15, 15), np.uint8))
+    bg_img = cv2.medianBlur(dilated, 21)
+    diff_img = 255 - cv2.absdiff(gray, bg_img)
+    norm_img = cv2.normalize(diff_img, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
+    return cv2.cvtColor(norm_img, cv2.COLOR_GRAY2BGR)
+
+
 def segment_components_by_color_bands(image, fuse_multicolor=False):
     """
-    HSV Band Thresholding to isolate foreground ink colors cleanly.
-    Includes an option to fuse touching/adjacent multi-colored objects into single components.
+    HSV Band Thresholding optimized for both thick markers and thin ink strokes.
     """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     h, w = image.shape[:2]
-    min_area = max(40, int(h * w * 0.00012))
+    min_area = max(20, int(h * w * 0.00008))
 
     color_ranges = [
-        # Purple / Violet (Sword)
+        # Purple / Violet (Sword / Dark strokes)
         {
             "name": "Purple/Violet",
-            "ranges": [(np.array([110, 35, 35]), np.array([155, 255, 255]))],
+            "ranges": [(np.array([110, 25, 25]), np.array([155, 255, 255]))],
             "role": "Sword"
         },
-        # Pink / Magenta (Writing)
+        # Pink / Magenta / Red
         {
             "name": "Pink/Magenta",
             "ranges": [
-                (np.array([156, 35, 35]), np.array([180, 255, 255])),
-                (np.array([0, 35, 35]), np.array([12, 255, 255]))
+                (np.array([156, 25, 25]), np.array([180, 255, 255])),
+                (np.array([0, 25, 25]), np.array([12, 255, 255]))
             ],
             "role": "Writing"
         },
         # Gold / Yellow
         {
             "name": "Gold/Yellow",
-            "ranges": [(np.array([13, 35, 35]), np.array([35, 255, 255]))],
+            "ranges": [(np.array([13, 25, 25]), np.array([35, 255, 255]))],
             "role": "Writing"
         },
         # Blue / Cyan
         {
             "name": "Blue/Cyan",
-            "ranges": [(np.array([85, 35, 35]), np.array([109, 255, 255]))],
+            "ranges": [(np.array([85, 25, 25]), np.array([109, 255, 255]))],
             "role": "Writing"
         },
         # Green
         {
             "name": "Green",
-            "ranges": [(np.array([36, 35, 35]), np.array([84, 255, 255]))],
+            "ranges": [(np.array([36, 25, 25]), np.array([84, 255, 255]))],
             "role": "Writing"
         },
-        # Dark / Black Ink
+        # Dark Ink (Thin or dark pen strokes)
         {
-            "name": "Black/Dark Ink",
-            "ranges": [(np.array([0, 0, 0]), np.array([180, 255, 120]))],
+            "name": "Dark Ink",
+            "ranges": [(np.array([0, 0, 0]), np.array([180, 255, 130]))],
             "role": "Writing"
         }
     ]
@@ -111,9 +123,8 @@ def segment_components_by_color_bands(image, fuse_multicolor=False):
 
         band_mask = cv2.bitwise_and(band_mask, cv2.bitwise_not(processed_mask))
 
-        kernel_close = np.ones((5, 5), np.uint8)
-        kernel_open = np.ones((3, 3), np.uint8)
-        band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_OPEN, kernel_open)
+        # Morphological operations tailored to keep fine lines connected
+        kernel_close = np.ones((3, 3), np.uint8)
         band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, kernel_close)
 
         num_labels, cc_labels, stats, centroids = cv2.connectedComponentsWithStats(
@@ -149,7 +160,6 @@ def segment_components_by_color_bands(image, fuse_multicolor=False):
 
     # --- MULTI-COLOR FUSION OPTION ---
     if fuse_multicolor and len(components) > 1:
-        # Dilate masks slightly to find touching components of different colors
         fused_components = []
         used = [False] * len(components)
 
@@ -162,13 +172,12 @@ def segment_components_by_color_bands(image, fuse_multicolor=False):
             role = components[i]["default_role"]
             used[i] = True
 
-            kernel_touch = np.ones((9, 9), np.uint8)
+            kernel_touch = np.ones((11, 11), np.uint8)
 
             for j in range(i + 1, len(components)):
                 if used[j]:
                     continue
 
-                # Check if component i touches component j
                 dilated_i = cv2.dilate(combined_mask.astype(np.uint8), kernel_touch)
                 overlap = cv2.bitwise_and(dilated_i, components[j]["mask"].astype(np.uint8))
 
@@ -425,10 +434,10 @@ def shift_mask(mask, dx, dy):
     return shifted > 0
 
 
-def shift_image(image, dx, dy):
+def shift_image(image, base_bg, dx, dy):
     h, w = image.shape[:2]
     matrix = np.float32([[1, 0, dx], [0, 1, dy]])
-    return cv2.warpAffine(image, matrix, (w, h), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
+    return cv2.warpAffine(image, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
 
 
 def render_sword(canvas, original, component, progress, entry_direction, penetration, angle_degrees):
@@ -455,7 +464,7 @@ def render_sword(canvas, original, component, progress, entry_direction, penetra
         dx += rotated_x * penetration_distance * pen_phase
         dy += rotated_y * penetration_distance * pen_phase
 
-    shifted = shift_image(original, int(round(dx)), int(round(dy)))
+    shifted = shift_image(original, canvas, int(round(dx)), int(round(dy)))
     shifted_mask = shift_mask(mask, int(round(dx)), int(round(dy)))
     canvas[shifted_mask] = shifted[shifted_mask]
 
@@ -475,16 +484,17 @@ def ease_out(t):
     return 1.0 - (1.0 - t) ** 3
 
 
-def render_animation_frame(original, components, assignments, frame_index, total_frames, show_pen):
-    canvas = np.full_like(original, 255, dtype=np.uint8)
+def render_animation_frame(original, base_background, components, assignments, frame_index, total_frames, show_pen):
+    # Initialize frame with selected background canvas (Pure White, Original Paper, or Cleaned Paper)
+    canvas = base_background.copy()
     global_progress = 1.0 if total_frames <= 1 else frame_index / float(total_frames - 1)
 
-    # Pass 1: Static
+    # Pass 1: Static elements
     for idx, component in enumerate(components):
         if assignments.get(idx, {}).get("role") == "Static":
             render_static_component(canvas, original, component)
 
-    # Pass 2: Writing
+    # Pass 2: Writing elements
     for idx, component in enumerate(components):
         config = assignments.get(idx, {})
         if config.get("role", "Writing") != "Writing":
@@ -498,7 +508,7 @@ def render_animation_frame(original, components, assignments, frame_index, total
         if show_pen and 0.0 < local < 1.0:
             draw_pen_tip(canvas, component, local)
 
-    # Pass 3: Sword / Weapon
+    # Pass 3: Sword / Weapon elements
     for idx, component in enumerate(components):
         config = assignments.get(idx, {})
         if config.get("role") != "Sword":
@@ -533,8 +543,11 @@ def build_gif(frames, duration=60):
 def create_component_preview(image, components, assignments=None):
     preview = image.copy()
     for idx, component in enumerate(components):
-        x1, y1, x2, y2 = component["bbox"]
         role = assignments.get(idx, {}).get("role", "Writing") if assignments else "Writing"
+        if role == "Ignore":
+            continue
+
+        x1, y1, x2, y2 = component["bbox"]
         rectangle_color = (255, 0, 0) if role == "Sword" else ((128, 128, 128) if role == "Static" else (0, 200, 0))
 
         cv2.rectangle(preview, (x1, y1), (x2, y2), rectangle_color, 2)
@@ -548,7 +561,8 @@ def create_component_preview(image, components, assignments=None):
 def role_description(role):
     if role == "Writing": return "✒️ Draw this component progressively."
     if role == "Sword": return "⚔️ Move this component from outside into the artwork."
-    return "📌 Show this component immediately."
+    if role == "Static": return "📌 Show this component immediately."
+    return "🚫 Hide this component (ignore shadows/artifacts)."
 
 
 # ============================================================
@@ -572,7 +586,24 @@ if uploaded_file is not None:
 
         st.sidebar.header("⚙️ Global Settings")
 
-        # MULTI-COLOR HANDLING OPTION
+        # CANVAS BACKGROUND BLENDING MODE
+        bg_mode = st.sidebar.selectbox(
+            "Background Canvas Style",
+            [
+                "Pure White Canvas",
+                "Original Paper Background",
+                "Cleaned Paper Texture"
+            ],
+            index=0
+        )
+
+        if bg_mode == "Pure White Canvas":
+            base_background = np.full_like(img, 255, dtype=np.uint8)
+        elif bg_mode == "Original Paper Background":
+            base_background = img.copy()
+        else:
+            base_background = create_clean_paper_background(img)
+
         color_handling = st.sidebar.radio(
             "Multi-Color Object Handling",
             [
@@ -626,8 +657,8 @@ if uploaded_file is not None:
             st.sidebar.caption(f"Size: {x2 - x1 + 1} × {y2 - y1 + 1} px")
 
             role = st.sidebar.selectbox(
-                "Role", ["Writing", "Sword", "Static"],
-                index=["Writing", "Sword", "Static"].index(default_role),
+                "Role", ["Writing", "Sword", "Static", "Ignore"],
+                index=["Writing", "Sword", "Static", "Ignore"].index(default_role if default_role in ["Writing", "Sword", "Static"] else "Writing"),
                 key=f"role_{idx}"
             )
             st.sidebar.caption(role_description(role))
@@ -690,8 +721,10 @@ if uploaded_file is not None:
                     "penetration": penetration,
                     "angle": angle,
                 }
-            else:
+            elif role == "Static":
                 assignments[idx] = {"role": "Static", "start": 0.0, "duration": 1.0}
+            else:
+                assignments[idx] = {"role": "Ignore", "start": 0.0, "duration": 0.0}
 
             st.sidebar.markdown("---")
 
@@ -708,12 +741,14 @@ if uploaded_file is not None:
         writing_count = sum(1 for a in assignments.values() if a.get("role") == "Writing")
         sword_count = sum(1 for a in assignments.values() if a.get("role") == "Sword")
         static_count = sum(1 for a in assignments.values() if a.get("role") == "Static")
+        ignore_count = sum(1 for a in assignments.values() if a.get("role") == "Ignore")
 
         st.info(
             f"Detected {len(parts)} color components — "
             f"✒️ Writing: {writing_count} | "
             f"⚔️ Sword: {sword_count} | "
-            f"📌 Static: {static_count}"
+            f"📌 Static: {static_count} | "
+            f"🚫 Ignored: {ignore_count}"
         )
 
         st.markdown("---")
@@ -726,7 +761,7 @@ if uploaded_file is not None:
             for frame_index in range(total_frames):
                 status.write(f"Rendering frame {frame_index + 1} / {total_frames}")
                 frame = render_animation_frame(
-                    img, parts, assignments, frame_index, total_frames, show_pen
+                    img, base_background, parts, assignments, frame_index, total_frames, show_pen
                 )
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames.append(Image.fromarray(np.ascontiguousarray(rgb_frame)))
