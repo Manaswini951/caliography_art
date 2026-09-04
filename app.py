@@ -22,8 +22,8 @@ st.set_page_config(
 st.title("✒️ Calligraphy Writing & Sword Animator")
 
 st.write(
-    "Upload your calligraphy artwork. The app uses HSV color-clustering "
-    "to separate distinct strokes (like swords vs letters) even when they overlap."
+    "Upload your calligraphy artwork. The app uses HSV color band thresholding "
+    "to isolate overlapping strokes, rendering them progressively on a pure white background."
 )
 
 
@@ -49,109 +49,76 @@ def resize_image(img, max_size=900):
     )
 
 
-def extract_ink_pixels(image):
+def segment_components_by_color_bands(image):
     """
-    Finds all non-paper background pixels.
-    Paper is generally bright and low in saturation compared to colored ink.
+    HSV Band Thresholding to isolate foreground ink colors cleanly.
     """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    saturation = hsv[:, :, 1]
-
-    # Colored ink mask: saturated OR dark
-    ink_mask = ((saturation > 40) | (gray < 210)).astype(np.uint8) * 255
-
-    # Clean up minor noise
-    kernel = np.ones((3, 3), np.uint8)
-    ink_mask = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN, kernel)
-
-    return ink_mask, hsv
-
-
-def segment_components_by_color(image):
-    """
-    Clusters foreground ink by color hue and saturation so overlapping
-    different-colored strokes (e.g. purple sword crossing pink letter)
-    get separated cleanly.
-    """
-    ink_mask, hsv = extract_ink_pixels(image)
     h, w = image.shape[:2]
-    min_area = max(50, int(h * w * 0.00015))
+    min_area = max(40, int(h * w * 0.00012))
 
-    # Extract HSV values of ink pixels for clustering
-    ys, xs = np.where(ink_mask > 0)
-    if len(xs) == 0:
-        return []
+    color_ranges = [
+        # Purple / Violet (Sword)
+        {
+            "name": "Purple/Violet",
+            "ranges": [(np.array([110, 35, 35]), np.array([155, 255, 255]))],
+            "role": "Sword"
+        },
+        # Pink / Magenta (Writing)
+        {
+            "name": "Pink/Magenta",
+            "ranges": [
+                (np.array([156, 35, 35]), np.array([180, 255, 255])),
+                (np.array([0, 35, 35]), np.array([12, 255, 255]))
+            ],
+            "role": "Writing"
+        },
+        # Gold / Yellow
+        {
+            "name": "Gold/Yellow",
+            "ranges": [(np.array([13, 35, 35]), np.array([35, 255, 255]))],
+            "role": "Writing"
+        },
+        # Blue / Cyan
+        {
+            "name": "Blue/Cyan",
+            "ranges": [(np.array([85, 35, 35]), np.array([109, 255, 255]))],
+            "role": "Writing"
+        },
+        # Green
+        {
+            "name": "Green",
+            "ranges": [(np.array([36, 35, 35]), np.array([84, 255, 255]))],
+            "role": "Writing"
+        },
+        # Dark / Black Ink
+        {
+            "name": "Black/Dark Ink",
+            "ranges": [(np.array([0, 0, 0]), np.array([180, 255, 120]))],
+            "role": "Writing"
+        }
+    ]
 
-    ink_hsv = hsv[ys, xs]
-
-    # Convert Hue (0-180 in OpenCV) and Saturation to Cartesian coordinates for 2D clustering
-    hues_rad = (ink_hsv[:, 0].astype(np.float32) / 180.0) * 2 * np.pi
-    sats = ink_hsv[:, 1].astype(np.float32) / 255.0
-
-    color_features = np.column_stack((
-        sats * np.cos(hues_rad) * 2.0,
-        sats * np.sin(hues_rad) * 2.0
-    ))
-
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
     components = []
+    processed_mask = np.zeros((h, w), dtype=np.uint8)
 
-    # Check color variance to see if multiple distinct colors exist
-    if np.std(color_features) > 0.15:
-        K = 2
-        # Safely acquire the correct OpenCV K-Means flags
-        flags = getattr(cv2, 'KMEANS_PP_CENTERS', getattr(cv2, 'KMEANS_RANDOM_CENTERS', 0))
+    for band in color_ranges:
+        band_mask = np.zeros((h, w), dtype=np.uint8)
+        for lower, upper in band["ranges"]:
+            m = cv2.inRange(hsv, lower, upper)
+            band_mask = cv2.bitwise_or(band_mask, m)
 
-        _, labels_kmeans, centers = cv2.kmeans(
-            color_features, K, None, criteria, 10, flags
-        )
+        band_mask = cv2.bitwise_and(band_mask, cv2.bitwise_not(processed_mask))
 
-        for cluster_id in range(K):
-            cluster_mask = np.zeros((h, w), dtype=np.uint8)
-            cluster_indices = np.where(labels_kmeans.ravel() == cluster_id)[0]
-            cluster_mask[ys[cluster_indices], xs[cluster_indices]] = 255
+        kernel_close = np.ones((5, 5), np.uint8)
+        kernel_open = np.ones((3, 3), np.uint8)
+        band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_OPEN, kernel_open)
+        band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, kernel_close)
 
-            # Morphological close to join solid strokes of same color
-            kernel = np.ones((5, 5), np.uint8)
-            cluster_mask = cv2.morphologyEx(cluster_mask, cv2.MORPH_CLOSE, kernel)
-
-            # Separate connected components inside this color cluster
-            num_labels, cc_labels, stats, centroids = cv2.connectedComponentsWithStats(
-                cluster_mask, connectivity=8
-            )
-
-            for label in range(1, num_labels):
-                area = int(stats[label, cv2.CC_STAT_AREA])
-                if area < min_area:
-                    continue
-
-                cx = int(stats[label, cv2.CC_STAT_LEFT])
-                cy = int(stats[label, cv2.CC_STAT_TOP])
-                cw = int(stats[label, cv2.CC_STAT_WIDTH])
-                ch = int(stats[label, cv2.CC_STAT_HEIGHT])
-
-                comp_mask = (cc_labels == label)
-
-                # Get average Hue for this component to identify role automatically
-                mean_hsv = cv2.mean(hsv, mask=comp_mask.astype(np.uint8))
-
-                components.append({
-                    "id": len(components) + 1,
-                    "mask": comp_mask,
-                    "bbox": (cx, cy, cx + cw - 1, cy + ch - 1),
-                    "center": (float(centroids[label][0]), float(centroids[label][1])),
-                    "area": area,
-                    "hue": mean_hsv[0],
-                    "sat": mean_hsv[1]
-                })
-
-    # Fallback to standard connected components if monochromatic or single color
-    if not components:
         num_labels, cc_labels, stats, centroids = cv2.connectedComponentsWithStats(
-            ink_mask, connectivity=8
+            band_mask, connectivity=8
         )
+
         for label in range(1, num_labels):
             area = int(stats[label, cv2.CC_STAT_AREA])
             if area < min_area:
@@ -161,6 +128,7 @@ def segment_components_by_color(image):
             cy = int(stats[label, cv2.CC_STAT_TOP])
             cw = int(stats[label, cv2.CC_STAT_WIDTH])
             ch = int(stats[label, cv2.CC_STAT_HEIGHT])
+
             comp_mask = (cc_labels == label)
             mean_hsv = cv2.mean(hsv, mask=comp_mask.astype(np.uint8))
 
@@ -171,10 +139,13 @@ def segment_components_by_color(image):
                 "center": (float(centroids[label][0]), float(centroids[label][1])),
                 "area": area,
                 "hue": mean_hsv[0],
-                "sat": mean_hsv[1]
+                "sat": mean_hsv[1],
+                "color_name": band["name"],
+                "default_role": band["role"]
             })
 
-    # Sort components left to right
+            processed_mask = cv2.bitwise_or(processed_mask, (comp_mask.astype(np.uint8) * 255))
+
     components.sort(key=lambda p: (p["bbox"][0], p["bbox"][1]))
     return components
 
@@ -408,6 +379,7 @@ def shift_mask(mask, dx, dy):
 def shift_image(image, dx, dy):
     h, w = image.shape[:2]
     matrix = np.float32([[1, 0, dx], [0, 1, dy]])
+    # Shifts image while padding background with pure white (255, 255, 255)
     return cv2.warpAffine(image, matrix, (w, h), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
 
 
@@ -455,16 +427,17 @@ def ease_out(t):
     return 1.0 - (1.0 - t) ** 3
 
 
-def render_animation_frame(original, white_canvas, components, assignments, frame_index, total_frames, show_pen):
-    canvas = white_canvas.copy()
+def render_animation_frame(original, components, assignments, frame_index, total_frames, show_pen):
+    # Pure white canvas for every frame (255, 255, 255)
+    canvas = np.full_like(original, 255, dtype=np.uint8)
     global_progress = 1.0 if total_frames <= 1 else frame_index / float(total_frames - 1)
 
-    # Pass 1: Static
+    # Pass 1: Static elements
     for idx, component in enumerate(components):
         if assignments.get(idx, {}).get("role") == "Static":
             render_static_component(canvas, original, component)
 
-    # Pass 2: Writing
+    # Pass 2: Writing elements (Progressively drawn onto pure white canvas)
     for idx, component in enumerate(components):
         config = assignments.get(idx, {})
         if config.get("role", "Writing") != "Writing":
@@ -478,7 +451,7 @@ def render_animation_frame(original, white_canvas, components, assignments, fram
         if show_pen and 0.0 < local < 1.0:
             draw_pen_tip(canvas, component, local)
 
-    # Pass 3: Sword
+    # Pass 3: Sword / Weapon elements (Moves in from offscreen onto pure white canvas)
     for idx, component in enumerate(components):
         config = assignments.get(idx, {})
         if config.get("role") != "Sword":
@@ -519,8 +492,8 @@ def create_component_preview(image, components, assignments=None):
 
         cv2.rectangle(preview, (x1, y1), (x2, y2), rectangle_color, 2)
         cv2.putText(
-            preview, f"P{idx + 1}", (x1, max(20, y1 - 7)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA
+            preview, f"P{idx + 1} ({component.get('color_name', '')})", (x1, max(20, y1 - 7)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA
         )
     return preview
 
@@ -550,10 +523,8 @@ if uploaded_file is not None:
 
         img = resize_image(img, max_size=900)
 
-        with st.spinner("Detecting components by color space (HSV)..."):
-            parts = segment_components_by_color(img)
-
-        white_canvas = np.full_like(img, 255, dtype=np.uint8)
+        with st.spinner("Detecting components using HSV band thresholding..."):
+            parts = segment_components_by_color_bands(img)
 
         if not parts:
             st.error("No artwork components were detected.")
@@ -580,14 +551,11 @@ if uploaded_file is not None:
 
         for idx, component in enumerate(parts):
             x1, y1, x2, y2 = component["bbox"]
-            hue = component.get("hue", 0)
+            default_role = component.get("default_role", "Writing")
+            color_name = component.get("color_name", "Ink")
 
-            st.sidebar.markdown(f"### P{idx + 1}")
+            st.sidebar.markdown(f"### P{idx + 1} - {color_name}")
             st.sidebar.caption(f"Size: {x2 - x1 + 1} × {y2 - y1 + 1} px")
-
-            # Auto-detect role by color hue (OpenCV Hue: Purple ~115-155)
-            is_purple = 115 <= hue <= 155
-            default_role = "Sword" if is_purple else "Writing"
 
             role = st.sidebar.selectbox(
                 "Role", ["Writing", "Sword", "Static"],
@@ -679,7 +647,7 @@ if uploaded_file is not None:
             for frame_index in range(total_frames):
                 status.write(f"Rendering frame {frame_index + 1} / {total_frames}")
                 frame = render_animation_frame(
-                    img, white_canvas, parts, assignments, frame_index, total_frames, show_pen
+                    img, parts, assignments, frame_index, total_frames, show_pen
                 )
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames.append(Image.fromarray(np.ascontiguousarray(rgb_frame)))
