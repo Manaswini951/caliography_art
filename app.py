@@ -58,7 +58,6 @@ def extract_ink_pixels(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     saturation = hsv[:, :, 1]
-    value = hsv[:, :, 2]
 
     # Colored ink mask: saturated OR dark
     ink_mask = ((saturation > 40) | (gray < 210)).astype(np.uint8) * 255
@@ -66,7 +65,7 @@ def extract_ink_pixels(image):
     # Clean up minor noise
     kernel = np.ones((3, 3), np.uint8)
     ink_mask = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN, kernel)
-    
+
     return ink_mask, hsv
 
 
@@ -86,9 +85,8 @@ def segment_components_by_color(image):
         return []
 
     ink_hsv = hsv[ys, xs]
-    
-    # We convert Hue (0-180 in OpenCV) and Saturation to a 2D space for K-Means color segmentation
-    # Hue is periodic, so convert to Cartesian coordinates
+
+    # Convert Hue (0-180 in OpenCV) and Saturation to Cartesian coordinates for 2D clustering
     hues_rad = (ink_hsv[:, 0].astype(np.float32) / 180.0) * 2 * np.pi
     sats = ink_hsv[:, 1].astype(np.float32) / 255.0
 
@@ -97,17 +95,17 @@ def segment_components_by_color(image):
         sats * np.sin(hues_rad) * 2.0
     ))
 
-    # Determine number of dominant ink colors (usually 2 to 4)
-    # Simple heuristic: try 2 color clusters first if colors differ significantly
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    
     components = []
 
-    # Check color variance to see if multiple colors exist
+    # Check color variance to see if multiple distinct colors exist
     if np.std(color_features) > 0.15:
         K = 2
+        # Safely acquire the correct OpenCV K-Means flags
+        flags = getattr(cv2, 'KMEANS_PP_CENTERS', getattr(cv2, 'KMEANS_RANDOM_CENTERS', 0))
+
         _, labels_kmeans, centers = cv2.kmeans(
-            color_features, K, None, criteria, 10, cv2.KMEANS_RAND_CENTERS
+            color_features, K, None, criteria, 10, flags
         )
 
         for cluster_id in range(K):
@@ -138,7 +136,7 @@ def segment_components_by_color(image):
 
                 # Get average Hue for this component to identify role automatically
                 mean_hsv = cv2.mean(hsv, mask=comp_mask.astype(np.uint8))
-                
+
                 components.append({
                     "id": len(components) + 1,
                     "mask": comp_mask,
@@ -205,7 +203,7 @@ def morphological_skeleton(binary):
 
 
 # ============================================================
-# PATH EXTRACTION & REVEAL MAPS
+# PATH EXTRACTION & REVEAL MASKS
 # ============================================================
 
 def skeleton_neighbors(point, skeleton):
@@ -587,8 +585,7 @@ if uploaded_file is not None:
             st.sidebar.markdown(f"### P{idx + 1}")
             st.sidebar.caption(f"Size: {x2 - x1 + 1} × {y2 - y1 + 1} px")
 
-            # Smart role auto-detection based on color hue:
-            # OpenCV Hue: Purple/Violet ~120-160, Pink/Magenta ~160-180 & 0-10
+            # Auto-detect role by color hue (OpenCV Hue: Purple ~115-155)
             is_purple = 115 <= hue <= 155
             default_role = "Sword" if is_purple else "Writing"
 
@@ -630,7 +627,7 @@ if uploaded_file is not None:
                 entry_direction = st.sidebar.selectbox(
                     "Sword Entry",
                     ["Top", "Bottom", "Left", "Right", "Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"],
-                    index=5, # Top-Right default for diagonal arrow
+                    index=5,
                     key=f"sword_entry_{idx}"
                 )
                 start_percent = st.sidebar.slider("Sword Start %", 0, 95, 50, key=f"sword_start_{idx}")
